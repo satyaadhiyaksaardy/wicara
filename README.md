@@ -59,15 +59,20 @@ it back when you want to copy something, and again to take it back. `/connect <i
 
 ## Demo
 
-[![asciicast](https://asciinema.org/a/nC7eumgE3Gqalxg2.svg)](https://asciinema.org/a/nC7eumgE3Gqalxg2)
+[![asciicast](https://asciinema.org/a/Utalbmuc14mVTb9q.svg)](https://asciinema.org/a/Utalbmuc14mVTb9q)
 
-A real recording of one side of a two-peer session: unlocking the identity, a
-peer dialling in by pasted key, live chat, a reaction, a reply with its quote,
-and a file arriving with its BLAKE3 shown on both screens. It is text, not
-video — you can select and copy out of it.
+Four machines on four networks, in one tmux window: a laptop, two lab servers —
+one of them behind a NAT — and an arm64 Jetson. Every pane shows the other three
+online over a direct hole-punched path, and the messages, the reaction and the
+reply travel between them with no server involved.
 
-The cast is in the repo as `demo.cast`, so `asciinema play demo.cast` works
-offline too.
+A [second recording](https://asciinema.org/a/nC7eumgE3Gqalxg2) follows one
+terminal more closely: unlocking the identity, dialling a peer by pasted key,
+and a file arriving with its BLAKE3 shown on both screens.
+
+Both are text rather than video, so you can select and copy out of them, and
+both are in the repo — `asciinema play demo-four-machines.cast` works offline.
+IP addresses are redacted; nothing else is edited.
 
 ## How it is put together
 
