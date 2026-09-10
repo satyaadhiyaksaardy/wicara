@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
 };
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -50,6 +50,28 @@ pub struct RoomView {
     /// False once you have been kicked — the room stays visible with its
     /// history, but you can no longer post to it.
     pub joined: bool,
+}
+
+/// How an outgoing op actually left this machine. The whole point of the design
+/// is that there are two paths; without this they look identical on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Delivery {
+    /// Straight down a live QUIC connection.
+    Wire,
+    /// Sealed and left on the hub for someone who is not there.
+    Mailbox,
+    /// Neither worked. It is saved locally and nowhere else.
+    Failed,
+}
+
+impl Delivery {
+    fn glyph(self) -> (&'static str, Color) {
+        match self {
+            Delivery::Wire => ("→", Color::DarkGray),
+            Delivery::Mailbox => ("✉", Color::Yellow),
+            Delivery::Failed => ("!", Color::Red),
+        }
+    }
 }
 
 /// A file hanging off a message.
@@ -93,6 +115,12 @@ pub enum UiEvent {
     Log {
         peer: [u8; 32],
         entries: Vec<Entry>,
+    },
+    /// How an outgoing op left. A room fans out to several peers, so the worst
+    /// outcome of the fan-out is the one worth showing.
+    Delivery {
+        id: MessageId,
+        state: Delivery,
     },
     /// Progress on an attachment, in either direction.
     Transfer {
@@ -183,6 +211,8 @@ struct Peer {
     unread: usize,
     /// Index into `log` of the message the chat cursor is on.
     cursor: usize,
+    /// Where the messages you have not seen begin.
+    unread_from: Option<usize>,
     /// Set when this conversation is a room rather than a person. A room id is
     /// 32 bytes exactly like an endpoint id, which is why one list holds both.
     room: Option<RoomView>,
@@ -232,7 +262,10 @@ pub struct Ui {
     status: String,
     /// Attachments in flight, by message id.
     transfers: HashMap<MessageId, (u64, u64)>,
+    delivery: HashMap<MessageId, Delivery>,
     commands: mpsc::UnboundedSender<UiCommand>,
+    /// `/help` takes over the chat pane until the next keypress.
+    help: bool,
     /// Whether the terminal is handing us mouse events. While it is, dragging
     /// selects nothing, so `/mouse` turns it off when you want to copy text.
     mouse: bool,
@@ -265,7 +298,9 @@ impl Ui {
             scroll: 0,
             status: "waiting for peers".into(),
             transfers: HashMap::new(),
+            delivery: HashMap::new(),
             commands,
+            help: false,
             mouse: true,
             peers_area: Rect::ZERO,
             chat_area: Rect::ZERO,
@@ -285,6 +320,7 @@ impl Ui {
                 path: String::new(),
                 log: Vec::new(),
                 unread: 0,
+                unread_from: None,
                 cursor: 0,
                 room: None,
             });
@@ -315,7 +351,8 @@ impl Ui {
             UiEvent::Log { peer, entries } => {
                 let selected = self.selected_key() == Some(peer);
                 let p = self.peer_mut(peer);
-                let grew = entries.len() > p.log.len();
+                let before = p.log.len();
+                let grew = entries.len() > before;
                 let at_end = p.cursor + 1 >= p.log.len();
                 p.log = entries;
                 if at_end {
@@ -324,10 +361,15 @@ impl Ui {
                 p.cursor = p.cursor.min(p.log.len().saturating_sub(1));
                 if grew && !selected {
                     p.unread += 1;
+                    p.unread_from.get_or_insert(before);
                 }
                 if selected {
                     self.scroll = 0;
                 }
+            }
+            UiEvent::Delivery { id, state } => {
+                let seen = self.delivery.entry(id).or_insert(state);
+                *seen = (*seen).max(state);
             }
             UiEvent::Transfer { id, done, total } => {
                 if done >= total {
@@ -358,6 +400,13 @@ impl Ui {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             let _ = self.commands.send(UiCommand::Quit);
             return false;
+        }
+        if self.help {
+            self.help = false;
+            // The key that dismissed it should not also do something else.
+            if !matches!(key.code, KeyCode::Char(_)) {
+                return true;
+            }
         }
 
         match key.code {
@@ -485,6 +534,7 @@ impl Ui {
                         self.sel = row;
                         self.scroll = 0;
                         self.peers[row].unread = 0;
+                        self.peers[row].unread_from = None;
                     }
                 } else if inside(chat, x, y) {
                     self.focus = Focus::Chat;
@@ -511,6 +561,7 @@ impl Ui {
         self.sel = ((self.sel as isize + delta).rem_euclid(n)) as usize;
         self.scroll = 0;
         self.peers[self.sel].unread = 0;
+        self.peers[self.sel].unread_from = None;
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -583,6 +634,7 @@ impl Ui {
             "room" => self.room_command(arg.trim()),
             "name" => self.name_command(arg.trim()),
             "whois" => self.whois(),
+            "help" => self.help = true,
             "mouse" => {
                 self.mouse = !self.mouse;
                 self.status = if self.mouse {
@@ -723,7 +775,7 @@ impl Ui {
     fn hints(&self) -> &'static str {
         match self.focus {
             Focus::Chat => "  ↑↓ pick · r reply · e edit · d delete · 1-5 react",
-            _ => "  tab · enter · /connect /name /whois /room /send · ^c quit",
+            _ => "  tab · enter · /help · ^c quit",
         }
     }
 
@@ -772,6 +824,9 @@ impl Ui {
     }
 
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
+        if self.help {
+            return self.draw_help(frame, area);
+        }
         let Some(peer) = self.peers.get(self.sel) else {
             frame.render_widget(
                 Paragraph::new("Paste a peer's EndpointId into `wicara run --connect` to begin.")
@@ -793,11 +848,16 @@ impl Ui {
                 && last_day != Some(date)
             {
                 last_day = Some(date);
-                let label = day_label(date);
-                let rule = "─".repeat(width.saturating_sub(label.width() + 4) / 2);
                 lines.push(Line::from(Span::styled(
-                    format!("{rule} {label} {rule}"),
+                    rule(&day_label(date), width),
                     Style::new().fg(Color::DarkGray),
+                )));
+                owners.push(usize::MAX);
+            }
+            if peer.unread_from == Some(i) {
+                lines.push(Line::from(Span::styled(
+                    rule("new", width),
+                    Style::new().fg(Color::Yellow),
                 )));
                 owners.push(usize::MAX);
             }
@@ -825,12 +885,25 @@ impl Ui {
 
             let stamp = clock(entry.id.ts_ms);
             let prefix = format!("{stamp} {who}: ");
+            // Consecutive messages from one person within a few minutes read as
+            // one run, so only the first carries the name and the clock.
+            let grouped = i > 0 && {
+                let prev = &peer.log[i - 1];
+                prev.id.sender == entry.id.sender
+                    && entry.id.ts_ms.saturating_sub(prev.id.ts_ms) < 5 * 60 * 1000
+                    && peer.unread_from != Some(i)
+                    && day(prev.id.ts_ms) == day(entry.id.ts_ms)
+            };
             // The clock stays out of the way; the name carries the colour.
             let head = || {
-                vec![
-                    Span::styled(format!("{stamp} "), Style::new().fg(Color::DarkGray)),
-                    Span::styled(format!("{who}: "), Style::new().fg(colour)),
-                ]
+                if grouped {
+                    vec![Span::raw(format!("{:w$}", "", w = prefix.width()))]
+                } else {
+                    vec![
+                        Span::styled(format!("{stamp} "), Style::new().fg(Color::DarkGray)),
+                        Span::styled(format!("{who}: "), Style::new().fg(colour)),
+                    ]
+                }
             };
             let body_width = width.saturating_sub(prefix.width()).max(8);
             if let Some(file) = &entry.attachment {
@@ -864,13 +937,21 @@ impl Ui {
                 spans.push(Span::styled("(deleted)", Style::new().fg(Color::DarkGray)));
                 lines.push(Line::from(spans));
             } else {
-                for (n, chunk) in wrap(&entry.body, body_width).into_iter().enumerate() {
+                let wrapped = wrap(&entry.body, body_width);
+                let last = wrapped.len().saturating_sub(1);
+                for (n, chunk) in wrapped.into_iter().enumerate() {
                     let mut spans = if n == 0 {
                         head()
                     } else {
                         vec![Span::raw(format!("{:w$}", "", w = prefix.width()))]
                     };
                     spans.extend(mention_spans(&chunk, &self.nickname));
+                    if n == last && entry.outbound
+                        && let Some(state) = self.delivery.get(&entry.id)
+                    {
+                        let (glyph, colour) = state.glyph();
+                        spans.push(Span::styled(format!(" {glyph}"), Style::new().fg(colour)));
+                    }
                     lines.push(Line::from(spans));
                 }
             }
@@ -927,21 +1008,73 @@ impl Ui {
         }
         self.chat_rows = rows;
 
-        let title = if peer.named() {
+        let mut title = if peer.named() {
             format!("{} — {}", peer.label(), peer.subtitle())
         } else {
             format!("{}? — unverified name — {}", peer.label(), peer.subtitle())
         };
+        if self.scroll > 0 {
+            title.push_str(&format!("  ↑{} scrolled back", self.scroll));
+        }
         frame.render_widget(
             Paragraph::new(view).block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(if self.focus == Focus::Chat {
                         Style::new().fg(Color::Cyan)
                     } else {
                         Style::new().fg(Color::DarkGray)
                     })
                     .title(title),
+            ),
+            area,
+        );
+    }
+
+    fn draw_help(&self, frame: &mut Frame, area: Rect) {
+        let dim = Style::new().fg(Color::DarkGray);
+        let key = Style::new().fg(Color::Cyan);
+        let rows: Vec<(&str, &str)> = vec![
+            ("tab / shift-tab", "move between the peer list, the chat and the input"),
+            ("↑ ↓", "pick a peer, or a message when the chat has focus"),
+            ("r  e  d", "reply · edit · delete the message under the cursor"),
+            ("1 – 5", "react 👍 ❤️ 😂 😮 😢"),
+            ("esc", "abandon a pending reply or edit"),
+            ("", ""),
+            ("/connect <id>", "dial a peer by the EndpointId they gave you"),
+            ("/name <alias>", "your own name for this peer — outranks their claim"),
+            ("/whois", "their full EndpointId, which is the real identity"),
+            ("/nick <name>", "change what you call yourself"),
+            ("/send <path>", "send a file — needs a live connection"),
+            ("/room create <name>", "start a room; then /room invite and /room kick"),
+            ("/peers  /whoami", "who is around · your own key"),
+            ("/mouse", "hand the mouse back so you can select and copy text"),
+            ("/quit", "leave"),
+            ("", ""),
+            ("→ ✉ !", "sent over the wire · left on the hub · went nowhere"),
+            ("name?", "a name they claim, that you have not confirmed"),
+        ];
+        let lines: Vec<Line> = rows
+            .into_iter()
+            .map(|(k, v)| {
+                if k.is_empty() {
+                    Line::default()
+                } else {
+                    Line::from(vec![
+                        Span::styled(format!("  {k:<20}"), key),
+                        Span::styled(v.to_string(), dim),
+                    ])
+                }
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(Color::Cyan))
+                    .title(" help — any key to close "),
             ),
             area,
         );
@@ -963,6 +1096,7 @@ impl Ui {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
                         .border_style(if self.focus == Focus::Input {
                             Style::new().fg(Color::Cyan)
                         } else {
@@ -980,6 +1114,7 @@ impl Ui {
     fn block(&self, title: &'static str, focus: Focus) -> Block<'static> {
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(if self.focus == focus {
                 Style::new().fg(Color::Cyan)
             } else {
@@ -1070,6 +1205,12 @@ fn clock(ts_ms: u64) -> String {
 fn day(ts_ms: u64) -> Option<chrono::NaiveDate> {
     chrono::DateTime::from_timestamp_millis(ts_ms as i64)
         .map(|t| t.with_timezone(&chrono::Local).date_naive())
+}
+
+/// A centred `──── label ────` rule, used for day breaks and the unread mark.
+fn rule(label: &str, width: usize) -> String {
+    let bar = "─".repeat(width.saturating_sub(label.width() + 2) / 2);
+    format!("{bar} {label} {bar}")
 }
 
 fn day_label(date: chrono::NaiveDate) -> String {

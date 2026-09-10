@@ -714,11 +714,21 @@ fn deliver(app: &App, conversation: [u8; 32], frame: Frame) {
 }
 
 fn deliver_to(app: &App, peer: [u8; 32], frame: Frame) {
+    let id = frame.id();
+    let report = |state| {
+        if let Some(id) = id {
+            let _ = app.events.send(UiEvent::Delivery { id, state });
+        }
+    };
     if app.live.lock().unwrap().contains_key(&peer) {
         let _ = app.outbound.send((Some(peer), frame));
+        report(ui::Delivery::Wire);
     } else if app.hub.is_some() {
+        // Provisional: mail_to reports again once the hub has actually taken it.
+        report(ui::Delivery::Mailbox);
         tokio::spawn(mail_to(app.clone(), peer, frame));
     } else {
+        report(ui::Delivery::Failed);
         app.status("peer is offline and no hub is configured — saved locally only");
     }
 }
@@ -895,7 +905,15 @@ async fn mail_to(app: App, peer: [u8; 32], frame: Frame) {
 
     match sent {
         Ok(()) => app.status(format!("{} is offline — left it on the hub", ui::short(&peer))),
-        Err(err) => app.status(format!("could not mail to {}: {err}", ui::short(&peer))),
+        Err(err) => {
+            if let Some(id) = frame.id() {
+                let _ = app.events.send(UiEvent::Delivery {
+                    id,
+                    state: ui::Delivery::Failed,
+                });
+            }
+            app.status(format!("could not mail to {}: {err}", ui::short(&peer)))
+        }
     }
 }
 
