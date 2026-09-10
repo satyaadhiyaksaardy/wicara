@@ -59,13 +59,15 @@ it back when you want to copy something, and again to take it back. `/connect <i
 
 ## Demo
 
-`demo.cast` is a real recording of one side of a two-peer session: unlocking the
-identity, a peer dialling in by pasted key, live chat, a reaction, a reply with
-its quote, and a file arriving with its BLAKE3 shown on both screens.
+[![asciicast](https://asciinema.org/a/nC7eumgE3Gqalxg2.svg)](https://asciinema.org/a/nC7eumgE3Gqalxg2)
 
-```sh
-asciinema play demo.cast     # or: asciinema upload demo.cast, and link it here
-```
+A real recording of one side of a two-peer session: unlocking the identity, a
+peer dialling in by pasted key, live chat, a reaction, a reply with its quote,
+and a file arriving with its BLAKE3 shown on both screens. It is text, not
+video — you can select and copy out of it.
+
+The cast is in the repo as `demo.cast`, so `asciinema play demo.cast` works
+offline too.
 
 ## How it is put together
 
