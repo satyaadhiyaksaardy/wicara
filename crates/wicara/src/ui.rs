@@ -571,7 +571,8 @@ impl Ui {
     }
 
     fn draw_peers(&self, frame: &mut Frame, area: Rect) {
-        // ponytail: peers only; rooms join this list at M4.
+        // Rooms and people share this list: a room id is 32 bytes, exactly
+        // like an endpoint id, so nothing needed a second list.
         let items: Vec<ListItem> = self
             .peers
             .iter()

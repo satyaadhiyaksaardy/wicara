@@ -16,13 +16,10 @@ use wicara_core::vault::{SALT_LEN, VaultKey, random};
 pub const FILE_NAME: &str = "identity.key";
 const MIN_PASSPHRASE: usize = 8;
 
-#[allow(dead_code)]
 pub struct Identity {
-    // ponytail: `vault` is unused until M1b wires up the encrypted store.
-
     pub secret: SecretKey,
-    /// Kept so the sqlite payload column (M1b) reuses the same derived key
-    /// instead of prompting again.
+    /// Handed straight to the message store, so the sqlite payload column is
+    /// sealed under the same derived key without prompting twice.
     pub vault: VaultKey,
 }
 
