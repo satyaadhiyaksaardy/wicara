@@ -87,6 +87,23 @@ impl Store {
         Ok(rows == 1)
     }
 
+    /// Every peer this endpoint has exchanged a message with, most recent first.
+    pub fn peers(&self) -> Result<Vec<[u8; 32]>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT peer FROM messages GROUP BY peer ORDER BY MAX(ts_ms) DESC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(
+                row?.as_slice()
+                    .try_into()
+                    .context("message store holds a malformed peer key")?,
+            );
+        }
+        Ok(out)
+    }
+
     /// The most recent `limit` messages with `peer`, oldest first.
     pub fn history(&self, peer: &[u8; 32], limit: usize) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
