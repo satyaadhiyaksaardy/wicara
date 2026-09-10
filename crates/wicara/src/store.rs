@@ -68,7 +68,8 @@ impl Store {
                  PRIMARY KEY (sender, seq, ts_ms)
              );
              CREATE INDEX IF NOT EXISTS ops_by_peer ON ops (peer, ts_ms);
-             CREATE TABLE IF NOT EXISTS rooms (id BLOB PRIMARY KEY, log BLOB NOT NULL);",
+             CREATE TABLE IF NOT EXISTS rooms (id BLOB PRIMARY KEY, log BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL);",
         )?;
         let resume: i64 = conn
             .query_row(
@@ -79,12 +80,52 @@ impl Store {
             .optional()?
             .flatten()
             .unwrap_or(0);
-        Ok(Self {
+        let store = Self {
             conn,
             vault,
             counter: Counter::new(me, resume as u64),
             me,
-        })
+        };
+        store.check_belongs_here(path)?;
+        Ok(store)
+    }
+
+    /// Everything in here is sealed under the identity's key, so a store left
+    /// beside a *different* identity file decrypts to nothing.
+    ///
+    /// Without this check that surfaces as "wrong passphrase", which is a lie —
+    /// the passphrase is fine, the store simply is not this identity's. Someone
+    /// replacing a lost identity hits exactly that and has no way to know what
+    /// to delete.
+    fn check_belongs_here(&self, path: &Path) -> Result<()> {
+        let sealed: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .or(self
+                .conn
+                .query_row("SELECT payload FROM ops LIMIT 1", [], |row| row.get(0))
+                .optional()?);
+
+        match sealed {
+            // Empty store, or one written before this check existed.
+            None => Ok(()),
+            Some(sealed) => self.vault.open(&sealed).map(|_| ()).map_err(|_| {
+                anyhow::anyhow!(
+                    "{} was written by a different identity, or under a different \
+                     passphrase, and cannot be read with the identity file beside it.\n\n\
+                     If you replaced a lost identity, this store went with it: delete \
+                     {} to start clean. Its contents cannot be recovered without the \
+                     old passphrase.",
+                    path.display(),
+                    path.display()
+                )
+            }),
+        }
     }
 
     pub fn next_id(&mut self) -> MessageId {
@@ -288,10 +329,6 @@ impl Store {
     /// Local, freely changeable display name. Kept beside the ops rather than in
     /// a config file so it travels with the encrypted store.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
-            [],
-        )?;
         let sealed: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -306,10 +343,6 @@ impl Store {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
-            [],
-        )?;
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -468,14 +501,18 @@ mod tests {
         reopened.set_setting("nickname", "satya").unwrap();
         assert_eq!(reopened.setting("nickname").unwrap().as_deref(), Some("satya"));
 
-        // A different passphrase cannot read any of it back.
-        let wrong = Store::open(
+        // A different passphrase is refused at open, naming the file to delete,
+        // rather than surfacing later as a bogus "wrong passphrase".
+        let err = match Store::open(
             &path,
             VaultKey::derive("wrong passphrase", &[3u8; SALT_LEN]).unwrap(),
             me,
-        )
-        .unwrap();
-        assert!(wrong.history(&peer, 10).is_err());
+        ) {
+            Ok(_) => panic!("a store from another identity must not open"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("different identity"), "{err}");
+        assert!(err.contains("ops.db"), "the message names the file: {err}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

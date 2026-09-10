@@ -30,6 +30,25 @@ passphrase is stored nowhere. **If you lose it, your identity and your history
 are gone — there is no reset, no recovery code, and no one to ask.** That is the
 design, not an oversight.
 
+### If you lose the passphrase
+
+There is nothing to recover and no account to reset — your identity *is* the
+keypair in that file, and only your passphrase decrypts it. What you can do is
+start over, which means deleting the whole directory, not just the key:
+
+```sh
+rm -rf ~/.config/wicara            # Linux
+rm -rf ~/Library/Application\ Support/wicara   # macOS
+rmdir /s %APPDATA%\wicara          # Windows
+```
+
+Next run generates a fresh identity. You get a **new EndpointId**, so peers have
+to add you again, and the old history stays unreadable forever.
+
+Deleting only `identity.key` leaves a message store sealed under the old key.
+wicara will tell you so and name the file rather than blaming your new
+passphrase, but the fix is the same: remove the directory.
+
 Inside the UI: click a peer, a message or the input bar, or press `tab` /
 `shift-tab` to cycle them. In the chat pane `↑↓` picks a message and `r`
 replies, `e` edits, `d` deletes and `1`–`5` react; the wheel scrolls.

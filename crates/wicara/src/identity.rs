@@ -53,7 +53,20 @@ fn load(path: &Path) -> Result<Identity> {
     let salt: [u8; SALT_LEN] = salt.try_into().expect("checked length");
 
     let vault = VaultKey::derive(&ask("Passphrase: ")?, &salt)?;
-    let secret = vault.open(sealed)?;
+    let secret = vault.open(sealed).map_err(|err| {
+        // The one place a user meets the no-recovery rule, so it says what to do
+        // rather than only what went wrong.
+        anyhow::anyhow!(
+            "{err}\n\n\
+             Could not unlock {}.\n\
+             There is no recovery for a lost passphrase — that is the design, not\n\
+             an oversight. To start over with a new identity, delete everything in\n\
+             {}. You will get a new EndpointId, peers will have to add you again,\n\
+             and your message history goes with it.",
+            path.display(),
+            path.parent().unwrap_or(path).display()
+        )
+    })?;
     let secret: [u8; 32] = secret
         .as_slice()
         .try_into()
