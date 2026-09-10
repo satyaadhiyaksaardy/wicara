@@ -109,10 +109,16 @@ Every message then gets a fresh ephemeral X25519 keypair, which gives forward
 secrecy on the sender's side.
 
 **Rooms are a signed, hash-chained membership log.** Each op — create, invite,
-kick — is signed by an admin and names the hash of the op before it. The hub
-stores the log; clients replay and verify all of it. The hub can withhold a log
-but cannot forge membership. Room messages are encrypted pairwise to each
-member, which is fine to roughly twenty of them.
+kick — is signed by an admin and names the hash of the op before it. Clients
+replay and verify the whole chain, so whoever hands it over is not trusted: the
+hub can withhold a log but cannot forge membership, and neither can a peer.
+
+Because the log carries its own proof, an invite carries the log itself rather
+than a pointer to it. **Rooms between connected peers need no server at all**,
+and a hub outage degrades them — no new members while you are apart — instead of
+breaking them. The hub is for reaching someone who is not there: it is where an
+offline member finds the room when they return. Room messages are encrypted
+pairwise to each member, which is fine to roughly twenty of them.
 
 **Attachments** go over their own QUIC stream in 64 KiB chunks with a BLAKE3
 hash checked on arrival. A file that does not match is deleted, not kept.

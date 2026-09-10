@@ -150,12 +150,17 @@ pub enum Frame {
         /// BLAKE3 of the contents, checked on arrival.
         hash: [u8; 32],
     },
-    /// "That room's log changed — go and look." A hint, never an authority:
-    /// the receiver fetches the log from the hub and verifies it, and only the
-    /// chain decides whether they are in the room. Forging one of these gets an
-    /// attacker nothing but a wasted fetch.
+    /// "That room's log changed — here it is." The log is self-verifying, so it
+    /// does not matter who hands it over: the receiver replays the chain and
+    /// only that decides membership. Carrying it means an invite between two
+    /// connected peers needs no server at all, and a hub outage degrades rooms
+    /// instead of breaking them.
+    ///
+    /// `log` may be empty, which keeps this a bare "go and look" for a receiver
+    /// that has a hub to ask. Forging either shape gets an attacker nothing.
     RoomUpdated {
         room: [u8; 32],
+        log: Vec<crate::room::RoomEntry>,
     },
 }
 

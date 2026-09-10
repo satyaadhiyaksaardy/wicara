@@ -119,8 +119,10 @@ impl App {
     /// was new — an op that arrived twice, live and by mailbox, lands here
     /// twice and is stored once.
     async fn accept(&self, sender: [u8; 32], frame: Frame) -> Result<Option<[u8; 32]>> {
-        if let Frame::RoomUpdated { room } = frame {
-            let _ = fetch_room(self, room).await;
+        if let Frame::RoomUpdated { room, log } = frame {
+            if let Err(err) = self.absorb_room(room, log).await {
+                tracing::warn!(%err, "could not take a room log");
+            }
             return Ok(None);
         }
         let Some(id) = frame.id() else { return Ok(None) };
@@ -155,6 +157,49 @@ impl App {
             .unwrap()
             .record(&conversation, &frame.unwrap_room())?;
         Ok(fresh.then_some(conversation))
+    }
+
+    /// Takes a membership log handed over by a peer, falling back to the hub.
+    ///
+    /// The chain is replayed here before any of it is believed, so a peer
+    /// handing one over is no more trusted than the hub is. It is accepted only
+    /// if it is longer than what we already hold — the same rule the hub
+    /// applies, and what stops a stale copy undoing a kick.
+    async fn absorb_room(&self, id: RoomId, log: Vec<RoomEntry>) -> Result<()> {
+        if log.is_empty() {
+            return fetch_room(self, id).await;
+        }
+        let room = verify_log(&log)?;
+        ensure!(room.id == id, "that log belongs to a different room");
+        // Otherwise any peer could push rooms into your sidebar. A room you
+        // already know still gets through, so a kick can reach the person
+        // being kicked.
+        let known = self.rooms.lock().unwrap().contains_key(&id);
+        ensure!(
+            known || room.members.contains(&self.me),
+            "a log for a room this endpoint is not in"
+        );
+
+        let held = self
+            .rooms
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map_or(0, |known| known.length);
+        if room.length <= held {
+            return Ok(());
+        }
+
+        self.store.lock().unwrap().save_room(&id, &log)?;
+        let joined = room.members.contains(&self.me);
+        let name = room.name.clone();
+        show_room(self, room)?;
+        self.status(if joined {
+            format!("#{name} membership updated")
+        } else {
+            format!("#{name}: you are no longer a member")
+        });
+        Ok(())
     }
 
     fn is_member(&self, room: &RoomId, who: &[u8; 32]) -> bool {
@@ -695,11 +740,18 @@ async fn append(app: &App, room: Option<RoomId>, op: RoomOp) -> Result<()> {
     let notify: BTreeSet<[u8; 32]> = before.union(&verified.members).copied().collect();
 
     app.store.lock().unwrap().save_room(&id, &entries)?;
-    publish_room(app, verified, entries).await?;
+    publish_room(app, verified, entries.clone()).await?;
 
     for member in notify {
         if member != app.me {
-            deliver_to(app, member, Frame::RoomUpdated { room: id });
+            deliver_to(
+                app,
+                member,
+                Frame::RoomUpdated {
+                    room: id,
+                    log: entries.clone(),
+                },
+            );
         }
     }
     Ok(())
