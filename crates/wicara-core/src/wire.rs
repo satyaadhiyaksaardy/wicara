@@ -89,12 +89,52 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Every op carries its own [`MessageId`], so every one of them is dedupable and
+/// mailboxable in its own right, and names the `target` it acts on. Who may do
+/// what is decided by the ids alone: only `target.sender` may edit or delete,
+/// and the receiver checks that — the sender is not asked to be honest about it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Frame {
-    /// First frame on every stream. The nickname is local metadata: freely
-    /// changeable, and never conflated with the EndpointId.
-    Hello { nickname: String },
-    Chat { id: MessageId, body: String },
+    /// First frame on every stream, and again after `/nick`. The nickname is
+    /// local metadata: freely changeable, never conflated with the EndpointId.
+    Hello {
+        nickname: String,
+    },
+    Chat {
+        id: MessageId,
+        body: String,
+        reply_to: Option<MessageId>,
+    },
+    Edit {
+        id: MessageId,
+        target: MessageId,
+        body: String,
+    },
+    Delete {
+        id: MessageId,
+        target: MessageId,
+    },
+    React {
+        id: MessageId,
+        target: MessageId,
+        emoji: String,
+        /// False removes the reaction, so the op is a toggle rather than a
+        /// state the two ends can disagree about.
+        on: bool,
+    },
+}
+
+impl Frame {
+    /// The id of the op itself, for dedup. `Hello` carries none.
+    pub fn id(&self) -> Option<MessageId> {
+        match self {
+            Frame::Hello { .. } => None,
+            Frame::Chat { id, .. }
+            | Frame::Edit { id, .. }
+            | Frame::Delete { id, .. }
+            | Frame::React { id, .. } => Some(*id),
+        }
+    }
 }
 
 /// `u32` little-endian length, then postcard. The length prefix is what makes a
@@ -176,6 +216,19 @@ mod tests {
             Frame::Chat {
                 id,
                 body: "hello — unicode ✓".into(),
+                reply_to: None,
+            },
+            Frame::Edit {
+                id,
+                target: id,
+                body: "fixed typo".into(),
+            },
+            Frame::Delete { id, target: id },
+            Frame::React {
+                id,
+                target: id,
+                emoji: "👍".into(),
+                on: true,
             },
         ] {
             let bytes = encode(&frame).unwrap();
@@ -193,6 +246,7 @@ mod tests {
         let two = Frame::Chat {
             id: Counter::new([0u8; 32], 0).mint(),
             body: "b".into(),
+            reply_to: None,
         };
 
         let mut buf = encode(&one).unwrap();
@@ -207,6 +261,7 @@ mod tests {
         let big = Frame::Chat {
             id: Counter::new([0u8; 32], 0).mint(),
             body: "x".repeat(MAX_FRAME + 1),
+            reply_to: None,
         };
         assert!(encode(&big).is_err());
 

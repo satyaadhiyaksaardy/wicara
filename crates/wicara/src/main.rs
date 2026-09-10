@@ -60,10 +60,40 @@ enum Cmd {
 #[derive(Clone)]
 struct App {
     store: Arc<Mutex<Store>>,
-    nickname: String,
+    /// Local metadata, changeable at runtime with `/nick`.
+    nickname: Arc<Mutex<String>>,
     events: mpsc::UnboundedSender<UiEvent>,
-    /// Fanned out to every session; each keeps only the lines addressed to it.
-    outbound: broadcast::Sender<([u8; 32], String)>,
+    /// Fanned out to every session; `None` means every peer, which is what a
+    /// nickname change is.
+    outbound: broadcast::Sender<(Option<[u8; 32]>, Frame)>,
+}
+
+impl App {
+    fn nickname(&self) -> String {
+        self.nickname.lock().unwrap().clone()
+    }
+
+    /// Refolds the conversation and hands the UI the whole thing. One fold, in
+    /// the store, rather than the same rules written twice.
+    fn send_log(&self, peer: [u8; 32]) -> Result<()> {
+        let entries = self
+            .store
+            .lock()
+            .unwrap()
+            .history(&peer, HISTORY_ON_START)?
+            .into_iter()
+            .map(|m| ui::Entry {
+                id: m.id,
+                body: m.body,
+                outbound: m.outbound,
+                deleted: m.deleted,
+                reply_to: m.reply_to,
+                reactions: m.reactions,
+            })
+            .collect();
+        let _ = self.events.send(UiEvent::Log { peer, entries });
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -130,10 +160,17 @@ async fn run(
     let ep = builder.bind().await?;
 
     let (events, event_rx) = mpsc::unbounded_channel();
-    let (commands, mut command_rx) = mpsc::unbounded_channel();
+    let (commands, command_rx) = mpsc::unbounded_channel();
+    // An explicit --nick wins for this run; otherwise the last /nick sticks.
+    let nickname = match nick {
+        Some(nick) => nick,
+        None => store
+            .setting("nickname")?
+            .unwrap_or_else(|| ep.id().fmt_short().to_string()),
+    };
     let app = App {
         store: Arc::new(Mutex::new(store)),
-        nickname: nick.unwrap_or_else(|| ep.id().fmt_short().to_string()),
+        nickname: Arc::new(Mutex::new(nickname)),
         events,
         outbound: broadcast::channel(256).0,
     };
@@ -165,40 +202,94 @@ async fn run(
         });
     }
 
-    let outbound = app.outbound.clone();
-    tokio::spawn(async move {
-        while let Some(cmd) = command_rx.recv().await {
-            match cmd {
-                UiCommand::Send { peer, body } => {
-                    let _ = outbound.send((peer, body));
-                }
-                UiCommand::Quit => break,
-            }
-        }
-    });
+    tokio::spawn(dispatch(app.clone(), command_rx));
 
-    let ui = Ui::new(ep.id().to_string(), app.nickname.clone(), commands);
+    let ui = Ui::new(ep.id().to_string(), app.nickname(), commands);
     let result = ui::run(ui, event_rx).await;
     ep.close().await;
     result
 }
 
+/// A peer's last-seen nickname, so an offline contact is still a name rather
+/// than a hex string.
+fn nick_key(peer: &[u8; 32]) -> String {
+    format!("nick:{}", ui::short(peer))
+}
+
 /// Seeds the UI with every known peer and their stored history, so the log is
 /// already there before anyone comes online.
 fn replay_history(app: &App) -> Result<()> {
-    let store = app.store.lock().unwrap();
-    for peer in store.peers()? {
-        let _ = app.events.send(UiEvent::Known { peer });
-        for msg in store.history(&peer, HISTORY_ON_START)? {
-            let _ = app.events.send(UiEvent::Message {
-                peer,
-                id: msg.id,
-                body: msg.body,
-                outbound: msg.outbound,
-            });
-        }
+    let peers = app.store.lock().unwrap().peers()?;
+    for peer in peers {
+        let nick = app.store.lock().unwrap().setting(&nick_key(&peer))?;
+        let _ = app.events.send(UiEvent::Known { peer, nick });
+        app.send_log(peer)?;
     }
     Ok(())
+}
+
+/// Turns what the user did into an op: mints its id, records it, refolds the
+/// conversation, and puts it on the wire. Minting in one place is what keeps
+/// the local view and the peer's view of an id identical.
+async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
+    while let Some(cmd) = commands.recv().await {
+        let (peer, frame) = match cmd {
+            UiCommand::Quit => return,
+            UiCommand::Nick(nick) => {
+                *app.nickname.lock().unwrap() = nick.clone();
+                if let Err(err) = app.store.lock().unwrap().set_setting("nickname", &nick) {
+                    let _ = app.events.send(UiEvent::Status(format!("could not save nick: {err}")));
+                }
+                let _ = app
+                    .outbound
+                    .send((None, Frame::Hello { nickname: nick }));
+                continue;
+            }
+            UiCommand::Send {
+                peer,
+                body,
+                reply_to,
+            } => {
+                let id = app.store.lock().unwrap().next_id();
+                (peer, Frame::Chat { id, body, reply_to })
+            }
+            UiCommand::Edit { peer, target, body } => {
+                let id = app.store.lock().unwrap().next_id();
+                (peer, Frame::Edit { id, target, body })
+            }
+            UiCommand::Delete { peer, target } => {
+                let id = app.store.lock().unwrap().next_id();
+                (peer, Frame::Delete { id, target })
+            }
+            UiCommand::React {
+                peer,
+                target,
+                emoji,
+                on,
+            } => {
+                let id = app.store.lock().unwrap().next_id();
+                (
+                    peer,
+                    Frame::React {
+                        id,
+                        target,
+                        emoji,
+                        on,
+                    },
+                )
+            }
+        };
+
+        let recorded = app.store.lock().unwrap().record(&peer, &frame);
+        match recorded.and_then(|_| app.send_log(peer)) {
+            Ok(()) => {
+                let _ = app.outbound.send((Some(peer), frame));
+            }
+            Err(err) => {
+                let _ = app.events.send(UiEvent::Status(format!("could not save: {err}")));
+            }
+        }
+    }
 }
 
 async fn accept_loop(ep: Endpoint, app: App) {
@@ -231,7 +322,7 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
     write_frame(
         &mut send,
         &Frame::Hello {
-            nickname: app.nickname.clone(),
+            nickname: app.nickname(),
         },
     )
     .await?;
@@ -239,6 +330,7 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
         bail!("peer did not open with a hello");
     };
 
+    remember_nick(&app, &peer, &them);
     let _ = app.events.send(UiEvent::Connected {
         peer,
         nick: them,
@@ -251,38 +343,48 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
         tokio::select! {
             frame = read_frame(&mut recv) => match frame {
                 Err(err) => break Err(err),
-                Ok(Some(Frame::Chat { id, body })) => {
+                Ok(None) => break Ok(()),
+                Ok(Some(Frame::Hello { nickname })) => {
+                    // Sent again after the peer runs /nick.
+                    remember_nick(&app, &peer, &nickname);
+                    let _ = app.events.send(UiEvent::Connected {
+                        peer,
+                        nick: nickname,
+                        path: describe_path(&conn).1,
+                    });
+                }
+                Ok(Some(frame)) => {
+                    let Some(id) = frame.id() else { continue };
                     // A peer may only mint ids under its own key. TLS proves who
                     // it is; this ties the application-level id to that proof.
+                    // Whether the op is *allowed* is decided again by the store,
+                    // so the rule holds however the op arrived.
                     if id.sender != peer {
                         break Err(anyhow::anyhow!("peer minted an id under someone else's key"));
                     }
-                    if app.store.lock().unwrap().insert(&peer, id, &body)? {
-                        let _ = app.events.send(UiEvent::Message { peer, id, body, outbound: false });
+                    if app.store.lock().unwrap().record(&peer, &frame)? {
+                        app.send_log(peer)?;
                     }
                 }
-                Ok(Some(other)) => tracing::debug!(?other, "ignoring unexpected frame"),
-                Ok(None) => break Ok(()),
             },
-            line = outbound.recv() => {
-                let Ok((target, body)) = line else { continue };
-                if target != peer {
+            outgoing = outbound.recv() => {
+                let Ok((target, frame)) = outgoing else { continue };
+                if target.is_some_and(|t| t != peer) {
                     continue;
                 }
-                let id = {
-                    let mut store = app.store.lock().unwrap();
-                    let id = store.next_id();
-                    store.insert(&peer, id, &body)?;
-                    id
-                };
-                write_frame(&mut send, &Frame::Chat { id, body: body.clone() }).await?;
-                let _ = app.events.send(UiEvent::Message { peer, id, body, outbound: true });
+                write_frame(&mut send, &frame).await?;
             }
         }
     };
 
     let _ = app.events.send(UiEvent::Disconnected { peer });
     result
+}
+
+fn remember_nick(app: &App, peer: &[u8; 32], nick: &str) {
+    if let Err(err) = app.store.lock().unwrap().set_setting(&nick_key(peer), nick) {
+        tracing::warn!(%err, "could not remember peer nickname");
+    }
 }
 
 /// Whether the live path is hole-punched or relayed. Returns the kind on its
