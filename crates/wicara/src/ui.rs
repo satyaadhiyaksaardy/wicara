@@ -8,7 +8,13 @@ use std::collections::HashMap;
 use anyhow::Result;
 use ratatui::{
     Frame,
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::{
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        },
+        execute,
+    },
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -141,7 +147,7 @@ pub enum UiCommand {
     Quit,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum Focus {
     Peers,
     Chat,
@@ -204,6 +210,17 @@ pub struct Ui {
     /// Attachments in flight, by message id.
     transfers: HashMap<MessageId, (u64, u64)>,
     commands: mpsc::UnboundedSender<UiCommand>,
+    /// Whether the terminal is handing us mouse events. While it is, dragging
+    /// selects nothing, so `/mouse` turns it off when you want to copy text.
+    mouse: bool,
+    /// Where each pane was drawn last frame, for hit-testing clicks.
+    peers_area: Rect,
+    chat_area: Rect,
+    input_area: Rect,
+    /// Scroll offset of the peer list, so a click maps to the right peer.
+    peer_state: ListState,
+    /// For each visible chat row, the message it belongs to.
+    chat_rows: Vec<usize>,
 }
 
 pub fn short(key: &[u8; 32]) -> String {
@@ -226,6 +243,12 @@ impl Ui {
             status: "waiting for peers".into(),
             transfers: HashMap::new(),
             commands,
+            mouse: true,
+            peers_area: Rect::ZERO,
+            chat_area: Rect::ZERO,
+            input_area: Rect::ZERO,
+            peer_state: ListState::default(),
+            chat_rows: Vec::new(),
         }
     }
 
@@ -319,6 +342,13 @@ impl Ui {
                     Focus::Chat => Focus::Input,
                 }
             }
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Input => Focus::Chat,
+                    Focus::Chat => Focus::Peers,
+                    Focus::Peers => Focus::Input,
+                }
+            }
             KeyCode::Esc => {
                 self.pending = None;
                 self.input.clear();
@@ -408,6 +438,45 @@ impl Ui {
         }
     }
 
+    /// Maps a click to whatever was drawn under it last frame.
+    fn on_mouse(&mut self, ev: MouseEvent) {
+        let (x, y) = (ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::ScrollUp if inside(inner(self.chat_area), x, y) => self.scroll += 3,
+            MouseEventKind::ScrollDown if inside(inner(self.chat_area), x, y) => {
+                self.scroll = self.scroll.saturating_sub(3)
+            }
+            MouseEventKind::ScrollUp => self.select_peer(-1),
+            MouseEventKind::ScrollDown => self.select_peer(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let peers = inner(self.peers_area);
+                let chat = inner(self.chat_area);
+                let input = inner(self.input_area);
+                if inside(peers, x, y) {
+                    self.focus = Focus::Peers;
+                    let row = (y - peers.y) as usize + self.peer_state.offset();
+                    if row < self.peers.len() {
+                        self.sel = row;
+                        self.scroll = 0;
+                        self.peers[row].unread = 0;
+                    }
+                } else if inside(chat, x, y) {
+                    self.focus = Focus::Chat;
+                    let clicked = self.chat_rows.get((y - chat.y) as usize).copied();
+                    if let (Some(owner), Some(p)) = (clicked, self.peers.get_mut(self.sel))
+                        && owner != usize::MAX
+                    {
+                        p.cursor = owner.min(p.log.len().saturating_sub(1));
+                    }
+                } else if inside(input, x, y) {
+                    self.focus = Focus::Input;
+                    self.caret = byte_at_column(&self.input, (x - input.x) as usize);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn select_peer(&mut self, delta: isize) {
         if self.peers.is_empty() {
             return;
@@ -486,6 +555,14 @@ impl Ui {
             }
             "nick" => self.status = "usage: /nick <name>".into(),
             "room" => self.room_command(arg.trim()),
+            "mouse" => {
+                self.mouse = !self.mouse;
+                self.status = if self.mouse {
+                    "mouse on — click to move around; /mouse again to select text".into()
+                } else {
+                    "mouse off — drag to select and copy; /mouse to turn it back on".into()
+                };
+            }
             "connect" => match parse_key(arg.trim()) {
                 Some(peer) => {
                     let _ = self.commands.send(UiCommand::Connect(peer));
@@ -554,6 +631,9 @@ impl Ui {
         let [sidebar, chat] =
             Layout::horizontal([Constraint::Length(22), Constraint::Fill(1)]).areas(top);
 
+        self.peers_area = sidebar;
+        self.chat_area = chat;
+        self.input_area = input;
         self.draw_peers(frame, sidebar);
         self.draw_chat(frame, chat);
         self.draw_input(frame, input);
@@ -574,11 +654,11 @@ impl Ui {
     fn hints(&self) -> &'static str {
         match self.focus {
             Focus::Chat => "  ↑↓ pick · r reply · e edit · d delete · 1-5 react",
-            _ => "  tab · enter · /connect /peers /nick /room /send · ^c quit",
+            _ => "  tab · enter · /connect /nick /room /send /mouse · ^c quit",
         }
     }
 
-    fn draw_peers(&self, frame: &mut Frame, area: Rect) {
+    fn draw_peers(&mut self, frame: &mut Frame, area: Rect) {
         // Rooms and people share this list: a room id is 32 bytes, exactly
         // like an endpoint id, so nothing needed a second list.
         let items: Vec<ListItem> = self
@@ -606,13 +686,14 @@ impl Ui {
             })
             .collect();
 
-        let mut state = ListState::default().with_selected(Some(self.sel));
+        self.peer_state.select(Some(self.sel));
+        let block = self.block("peers", Focus::Peers);
         frame.render_stateful_widget(
             List::new(items)
-                .block(self.block("peers", Focus::Peers))
+                .block(block)
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
             area,
-            &mut state,
+            &mut self.peer_state,
         );
     }
 
@@ -628,6 +709,8 @@ impl Ui {
 
         let width = (area.width.saturating_sub(2) as usize).max(8);
         let mut lines: Vec<Line> = Vec::new();
+        // Which message each rendered row came from, so a click can land on it.
+        let mut owners: Vec<usize> = Vec::new();
         // Where the cursor's message starts and ends, so it can be scrolled to.
         let mut cursor_span = (0usize, 0usize);
         for (i, entry) in peer.log.iter().enumerate() {
@@ -715,6 +798,7 @@ impl Ui {
                 )));
             }
 
+            owners.resize(lines.len(), i);
             if i == peer.cursor && self.focus == Focus::Chat {
                 cursor_span = (start, lines.len());
                 for line in &mut lines[start..] {
@@ -737,10 +821,13 @@ impl Ui {
         self.scroll = self.scroll.min(max_scroll);
         let start = max_scroll - self.scroll;
         let mut view: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
+        let mut rows: Vec<usize> = owners.into_iter().skip(start).take(height).collect();
         // Chat reads from the bottom, so a short log is padded above, not below.
-        for _ in view.len()..height {
+        while view.len() < height {
             view.insert(0, Line::default());
+            rows.insert(0, usize::MAX);
         }
+        self.chat_rows = rows;
 
         let title = format!("{} — {}", peer.label(), peer.subtitle());
         frame.render_widget(
@@ -841,6 +928,33 @@ fn first_line(text: &str, width: usize) -> String {
     }
 }
 
+/// The drawable area inside a bordered block.
+fn inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn inside(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+}
+
+/// Byte offset of the character drawn at `column`, so clicking in the input bar
+/// puts the caret where it looks like it should be.
+fn byte_at_column(text: &str, column: usize) -> usize {
+    let mut width = 0;
+    for (i, c) in text.char_indices() {
+        if width >= column {
+            return i;
+        }
+        width += c.width().unwrap_or(0);
+    }
+    text.len()
+}
+
 fn parse_key(hex: &str) -> Option<[u8; 32]> {
     data_encoding::HEXLOWER_PERMISSIVE
         .decode(hex.trim().as_bytes())
@@ -916,6 +1030,8 @@ pub async fn run(mut ui: Ui, mut events: mpsc::UnboundedReceiver<UiEvent>) -> Re
     // crash mid-demo leaves the shell in raw mode with no echo.
     let mut terminal = ratatui::init();
     let result = event_loop(&mut ui, &mut events, &mut terminal).await;
+    // Mouse capture is ours, not ratatui's, so it is ours to hand back.
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -936,11 +1052,23 @@ async fn event_loop(
         }
     });
 
+    let mut capturing = false;
     terminal.draw(|f| ui.draw(f))?;
     loop {
+        // `/mouse` flips the flag; the terminal is told here, where the IO lives.
+        if ui.mouse != capturing {
+            let out = &mut std::io::stdout();
+            let _ = if ui.mouse {
+                execute!(out, EnableMouseCapture)
+            } else {
+                execute!(out, DisableMouseCapture)
+            };
+            capturing = ui.mouse;
+        }
         tokio::select! {
             key = keys.recv() => match key {
                 Some(Event::Key(key)) => if !ui.on_key(key) { return Ok(()) },
+                Some(Event::Mouse(m)) => ui.on_mouse(m),
                 Some(_) => {}
                 None => return Ok(()),
             },
@@ -1159,6 +1287,97 @@ mod tests {
         assert_ne!(spans[1].style, spans[3].style, "your own mention stands out");
         assert_eq!(mention_spans("no mentions", "satya").len(), 1);
         assert_eq!(mention_spans("", "satya").len(), 0);
+    }
+
+    #[test]
+    fn clicks_land_on_whatever_was_drawn_under_them() {
+        let (mut ui, _rx) = ui();
+        ui.apply(UiEvent::Known { peer: [1; 32], nick: Some("one".into()) });
+        ui.apply(UiEvent::Known { peer: [2; 32], nick: Some("two".into()) });
+        // Pretend a frame was drawn: 20-wide sidebar, chat beside it, input below.
+        ui.peers_area = Rect { x: 0, y: 0, width: 20, height: 10 };
+        ui.chat_area = Rect { x: 20, y: 0, width: 40, height: 10 };
+        ui.input_area = Rect { x: 0, y: 10, width: 60, height: 3 };
+        ui.chat_rows = vec![usize::MAX, 0, 1];
+
+        let click = |x, y| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Second row of the peer list is the second peer.
+        ui.on_mouse(click(3, 2));
+        assert_eq!(ui.focus, Focus::Peers);
+        assert_eq!(ui.sel, 1);
+
+        // A click past the last peer moves focus but selects nothing new.
+        ui.on_mouse(click(3, 8));
+        assert_eq!(ui.sel, 1);
+
+        // The input bar takes the caret to the character under the pointer.
+        ui.on_mouse(click(1, 11));
+        assert_eq!(ui.focus, Focus::Input);
+        for c in "hello".chars() {
+            press(&mut ui, c);
+        }
+        assert_eq!(ui.caret, 5);
+        ui.on_mouse(click(3, 11));
+        assert_eq!(ui.caret, 2, "caret follows the pointer");
+
+        // Padding rows in the chat pane are not messages.
+        ui.on_mouse(click(25, 1));
+        assert_eq!(ui.focus, Focus::Chat);
+
+        // Scrolling over the chat pane scrolls; elsewhere it changes peer.
+        let wheel = |kind, x, y| MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE };
+        ui.on_mouse(wheel(MouseEventKind::ScrollUp, 25, 5));
+        assert_eq!(ui.scroll, 3);
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown, 25, 5));
+        assert_eq!(ui.scroll, 0);
+        let before = ui.sel;
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown, 3, 3));
+        assert_ne!(ui.sel, before, "wheel over the sidebar changes conversation");
+    }
+
+    #[test]
+    fn byte_at_column_respects_wide_characters() {
+        assert_eq!(byte_at_column("hello", 0), 0);
+        assert_eq!(byte_at_column("hello", 3), 3);
+        assert_eq!(byte_at_column("hello", 99), 5);
+        // 'é' is two bytes, one column.
+        assert_eq!(byte_at_column("héllo", 2), 3);
+        // CJK is one char, two columns.
+        assert_eq!(byte_at_column("日本", 2), 3);
+    }
+
+    #[test]
+    fn mouse_toggle_flips_and_reports() {
+        let (mut ui, _rx) = ui();
+        assert!(ui.mouse, "clicking works out of the box");
+        for c in "/mouse".chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(!ui.mouse && ui.status.contains("select and copy"));
+        for c in "/mouse".chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(ui.mouse);
+    }
+
+    #[test]
+    fn shift_tab_cycles_the_other_way() {
+        let (mut ui, _rx) = ui();
+        assert_eq!(ui.focus, Focus::Input);
+        ui.on_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(ui.focus, Focus::Chat);
+        ui.on_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(ui.focus, Focus::Peers);
+        ui.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(ui.focus, Focus::Chat);
     }
 
     #[test]

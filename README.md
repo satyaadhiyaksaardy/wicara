@@ -30,9 +30,12 @@ passphrase is stored nowhere. **If you lose it, your identity and your history
 are gone — there is no reset, no recovery code, and no one to ask.** That is the
 design, not an oversight.
 
-Inside the UI: `tab` cycles the peer list, the chat and the input bar; in the
-chat pane `↑↓` picks a message and `r` replies, `e` edits, `d` deletes and `1`–`5`
-react. `/connect <id>` `/peers` `/whoami` `/nick <name>` `/send <path>`
+Inside the UI: click a peer, a message or the input bar, or press `tab` /
+`shift-tab` to cycle them. In the chat pane `↑↓` picks a message and `r`
+replies, `e` edits, `d` deletes and `1`–`5` react; the wheel scrolls.
+
+While the mouse is captured your terminal cannot select text, so `/mouse` hands
+it back when you want to copy something, and again to take it back. `/connect <id>` `/peers` `/whoami` `/nick <name>` `/send <path>`
 `/room create <name>` `/room invite <id>` `/room kick <id>` `/quit`.
 
 ## Demo
