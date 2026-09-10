@@ -128,6 +128,36 @@ XChaCha20-Poly1305 under a key derived from your passphrase with Argon2id. Not
 SQLCipher — that is a C dependency that fights the Windows build for a job the
 application already does.
 
+## Running without a server
+
+The hub is optional, and most of wicara does not involve it. Leave `--hub` off
+and there is no server anywhere in the picture — not for chat, not for files,
+not for rooms.
+
+| without `--hub` | |
+|---|---|
+| Live 1:1 chat, direct or relayed | works |
+| History, encrypted at rest | works |
+| File transfer with BLAKE3 checks | works |
+| Rooms: create, invite, kick, message | works, between connected peers |
+| Messaging someone who is **offline** | needs the hub |
+| Being invited to a room while **away** | needs the hub |
+
+The pattern is one line: **the hub is for reaching someone who is not there.**
+Everything that happens between two people who are both online happens between
+them.
+
+That is why a room invite carries the membership log instead of a pointer to
+it. The log proves itself — every op signed, every op naming the hash before it
+— so it does not matter who hands it over, and there is no reason to make a
+server do it. A hub outage costs you new members while you are apart, not the
+room.
+
+The relay is a separate thing and is not a server in this sense: it forwards
+sealed packets for peers whose NATs will not cooperate, holds nothing, and is
+used by roughly one connection in twenty. See the threat model for what it does
+learn.
+
 ## Threat model
 
 Being exact about this is the point of the project, so here is the whole of it.
