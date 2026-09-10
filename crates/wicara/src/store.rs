@@ -69,7 +69,12 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS ops_by_peer ON ops (peer, ts_ms);
              CREATE TABLE IF NOT EXISTS rooms (id BLOB PRIMARY KEY, log BLOB NOT NULL);
-             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL);",
+             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             -- Who you know, kept apart from what they said. Clearing a
+             -- conversation must not make the person disappear.
+             CREATE TABLE IF NOT EXISTS contacts (peer BLOB PRIMARY KEY);
+             INSERT OR IGNORE INTO contacts (peer) SELECT DISTINCT peer FROM ops;
+             INSERT OR IGNORE INTO contacts (peer) SELECT id FROM rooms;",
         )?;
         let resume: i64 = conn
             .query_row(
@@ -141,6 +146,10 @@ impl Store {
             return Ok(false);
         };
         let payload = self.vault.seal(&postcard::to_stdvec(frame)?)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO contacts (peer) VALUES (?1)",
+            params![&peer[..]],
+        )?;
         let rows = self.conn.execute(
             "INSERT OR IGNORE INTO ops (sender, seq, ts_ms, peer, payload)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -155,11 +164,15 @@ impl Store {
         Ok(rows == 1)
     }
 
-    /// Every peer this endpoint has exchanged an op with, most recent first.
+    /// Everyone you know, busiest first. Drawn from the contact list rather
+    /// than from the messages, so a cleared conversation keeps its peer.
     pub fn peers(&self) -> Result<Vec<[u8; 32]>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT peer FROM ops GROUP BY peer ORDER BY MAX(ts_ms) DESC")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT c.peer FROM contacts c
+             LEFT JOIN ops o ON o.peer = c.peer
+             GROUP BY c.peer
+             ORDER BY COALESCE(MAX(o.ts_ms), 0) DESC",
+        )?;
         let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -296,6 +309,10 @@ impl Store {
     /// on our own disk.
     pub fn save_room(&self, id: &RoomId, entries: &[RoomEntry]) -> Result<()> {
         self.conn.execute(
+            "INSERT OR IGNORE INTO contacts (peer) VALUES (?1)",
+            params![&id[..]],
+        )?;
+        self.conn.execute(
             "INSERT INTO rooms (id, log) VALUES (?1, ?2)
              ON CONFLICT(id) DO UPDATE SET log = excluded.log",
             params![&id[..], self.vault.seal(&postcard::to_stdvec(entries)?)?],
@@ -363,8 +380,63 @@ impl Store {
         }
         tx.execute("DELETE FROM ops WHERE peer = ?1", params![&peer[..]])?;
         tx.execute("DELETE FROM rooms WHERE id = ?1", params![&peer[..]])?;
+        tx.execute("DELETE FROM contacts WHERE peer = ?1", params![&peer[..]])?;
         tx.commit()?;
         Ok(files)
+    }
+
+    /// Empties one conversation but keeps whose it was: the contact, the room
+    /// log, and the names all survive. `forget` is the one that removes the
+    /// person.
+    pub fn clear(&mut self, peer: &[u8; 32]) -> Result<Vec<String>> {
+        let msgs = self.history(peer, usize::MAX)?;
+        let files = msgs
+            .iter()
+            .filter_map(|m| m.attachment.as_ref().and_then(|a| a.path.clone()))
+            .collect();
+        let tx = self.conn.transaction()?;
+        for msg in &msgs {
+            tx.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![file_key(&msg.id)],
+            )?;
+        }
+        tx.execute("DELETE FROM ops WHERE peer = ?1", params![&peer[..]])?;
+        tx.commit()?;
+        Ok(files)
+    }
+
+    /// Every conversation, every room, every remembered name. Keeps only what
+    /// makes you *you*: the identity is a separate file, and the prekey has to
+    /// survive or mail already sealed to it could never be opened.
+    pub fn wipe(&mut self) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        for peer in self.peers()? {
+            files.extend(
+                self.history(&peer, usize::MAX)?
+                    .into_iter()
+                    .filter_map(|m| m.attachment.and_then(|a| a.path)),
+            );
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM ops", [])?;
+        tx.execute("DELETE FROM rooms", [])?;
+        tx.execute("DELETE FROM contacts", [])?;
+        tx.execute("DELETE FROM settings WHERE key != 'prekey'", [])?;
+        tx.commit()?;
+        Ok(files)
+    }
+
+    /// How much a wipe would take: conversations, messages, files.
+    pub fn wipe_preview(&self) -> Result<(usize, usize, usize)> {
+        let peers = self.peers()?;
+        let (mut msgs, mut files) = (0, 0);
+        for peer in &peers {
+            let (m, f) = self.forget_preview(peer)?;
+            msgs += m;
+            files += f;
+        }
+        Ok((peers.len(), msgs, files))
     }
 
     /// Local, freely changeable display name. Kept beside the ops rather than in
@@ -554,6 +626,50 @@ mod tests {
         };
         assert!(err.contains("different identity"), "{err}");
         assert!(err.contains("ops.db"), "the message names the file: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_keeps_the_contact_and_forget_does_not() {
+        let dir = std::env::temp_dir().join(format!("wicara-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ops.db");
+        let _ = std::fs::remove_file(&path);
+
+        let (me, peer, other) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let mut store = open(&path, me);
+        for (conv, body) in [(peer, "to you"), (other, "to them")] {
+            let id = store.next_id();
+            store.record(&conv, &chat(id, body)).unwrap();
+        }
+        store.set_setting("alias:aaaaaaaaaa", "bob").unwrap();
+        assert_eq!(store.peers().unwrap().len(), 2);
+
+        // Clearing empties the conversation and leaves the person.
+        store.clear(&peer).unwrap();
+        assert!(store.history(&peer, 10).unwrap().is_empty());
+        assert_eq!(store.peers().unwrap().len(), 2, "the contact survives a clear");
+        assert_eq!(store.history(&other, 10).unwrap().len(), 1, "others untouched");
+
+        // A cleared peer is still there after a reopen — the contact list is
+        // not derived from the messages.
+        drop(store);
+        let mut store = open(&path, me);
+        assert_eq!(store.peers().unwrap().len(), 2);
+
+        // Forgetting takes the person too.
+        store.forget(&peer, &["alias:aaaaaaaaaa".to_string()]).unwrap();
+        assert_eq!(store.peers().unwrap(), vec![other]);
+        assert!(store.setting("alias:aaaaaaaaaa").unwrap().is_none());
+
+        // Wipe takes everything but the prekey.
+        store.set_setting("prekey", "keepme").unwrap();
+        let (convs, msgs, _) = store.wipe_preview().unwrap();
+        assert_eq!((convs, msgs), (1, 1));
+        store.wipe().unwrap();
+        assert!(store.peers().unwrap().is_empty());
+        assert_eq!(store.setting("prekey").unwrap().as_deref(), Some("keepme"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

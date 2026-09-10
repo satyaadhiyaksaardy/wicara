@@ -428,6 +428,17 @@ fn dial_peer(app: &App, peer: [u8; 32], announce: bool) {
     });
 }
 
+/// Removes files, counting the ones that were actually there.
+async fn unlink_all(paths: &[String]) -> usize {
+    let mut gone = 0;
+    for path in paths {
+        if tokio::fs::remove_file(path).await.is_ok() {
+            gone += 1;
+        }
+    }
+    gone
+}
+
 /// Deletes a conversation from this machine and drops the connection with it.
 ///
 /// Local only: the other side keeps everything. Attachments go too, because a
@@ -443,12 +454,7 @@ async fn forget(app: &App, peer: [u8; 32]) -> Result<()> {
 
     let names = [nick_key(&peer), alias_key(&peer)];
     let files = app.store.lock().unwrap().forget(&peer, &names)?;
-    let mut removed = 0;
-    for path in &files {
-        if tokio::fs::remove_file(path).await.is_ok() {
-            removed += 1;
-        }
-    }
+    let removed = unlink_all(&files).await;
     let _ = app.events.send(UiEvent::Forgotten { peer });
     app.status(format!(
         "forgotten — {} attachment(s) deleted from this machine",
@@ -569,6 +575,61 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                              this machine — no undo. Their copy is untouched."
                         )),
                         Err(err) => app.status(format!("could not read that conversation: {err}")),
+                    }
+                }
+                continue;
+            }
+            UiCommand::Clear { peer, confirm } => {
+                if confirm {
+                    // Bound first: the guard would otherwise live across the
+                    // await below, which is neither Send nor safe.
+                    let cleared = app.store.lock().unwrap().clear(&peer);
+                    match cleared {
+                        Ok(files) => {
+                            let n = unlink_all(&files).await;
+                            let _ = app.send_log(peer);
+                            app.status(format!("conversation emptied — {n} file(s) deleted"));
+                        }
+                        Err(err) => app.status(format!("could not clear that: {err}")),
+                    }
+                } else {
+                    match app.store.lock().unwrap().forget_preview(&peer) {
+                        Ok((msgs, files)) => app.status(format!(
+                            "/clear yes  deletes {msgs} message(s) and {files} file(s) but keeps \
+                             the contact — no undo. Their copy is untouched."
+                        )),
+                        Err(err) => app.status(format!("could not read that conversation: {err}")),
+                    }
+                }
+                continue;
+            }
+            UiCommand::Wipe { confirm } => {
+                if confirm {
+                    for (peer, conn) in app.live.lock().unwrap().drain() {
+                        let _ = peer;
+                        conn.close(0u32.into(), b"wiped");
+                    }
+                    app.rooms.lock().unwrap().clear();
+                    app.prekeys.lock().unwrap().clear();
+                    let wiped = app.store.lock().unwrap().wipe();
+                    match wiped {
+                        Ok(files) => {
+                            let n = unlink_all(&files).await;
+                            let _ = app.events.send(UiEvent::Wiped);
+                            app.status(format!(
+                                "everything deleted — {n} file(s) gone. Your identity is untouched."
+                            ));
+                        }
+                        Err(err) => app.status(format!("could not wipe: {err}")),
+                    }
+                } else {
+                    match app.store.lock().unwrap().wipe_preview() {
+                        Ok((peers, msgs, files)) => app.status(format!(
+                            "/wipe yes  deletes all {peers} conversation(s), {msgs} message(s) \
+                             and {files} file(s) from this machine. Your identity survives; \
+                             nothing else does."
+                        )),
+                        Err(err) => app.status(format!("could not read the store: {err}")),
                     }
                 }
                 continue;

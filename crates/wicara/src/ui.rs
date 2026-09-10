@@ -130,6 +130,8 @@ pub enum UiEvent {
     },
     /// A conversation was deleted from this machine.
     Forgotten { peer: [u8; 32] },
+    /// Everything was. The UI starts over from whatever is reloaded after.
+    Wiped,
     /// A room appeared or its membership changed.
     Room {
         id: [u8; 32],
@@ -182,6 +184,10 @@ pub enum UiCommand {
     /// Delete a conversation from this machine. Local, and irreversible.
     /// `confirm: false` only asks what would go.
     Forget { peer: [u8; 32], confirm: bool },
+    /// Empty a conversation but keep whose it was.
+    Clear { peer: [u8; 32], confirm: bool },
+    /// Every conversation on this machine. Keeps the identity.
+    Wipe { confirm: bool },
     Room(RoomCommand),
     SendFile {
         peer: [u8; 32],
@@ -397,6 +403,14 @@ impl Ui {
                 self.sel = self.sel.min(self.peers.len().saturating_sub(1));
                 self.scroll = 0;
                 self.delivery.clear();
+            }
+            UiEvent::Wiped => {
+                self.peers.clear();
+                self.index.clear();
+                self.delivery.clear();
+                self.transfers.clear();
+                self.sel = 0;
+                self.scroll = 0;
             }
             UiEvent::Room { id, view } => self.peer_mut(id).room = Some(view),
             UiEvent::Status(s) => self.status = s,
@@ -665,6 +679,20 @@ impl Ui {
                 None => self.status = "select a room first".into(),
             },
             "forget" => self.forget_command(arg.trim()),
+            "clear" => match self.selected_key() {
+                Some(peer) => {
+                    let _ = self.commands.send(UiCommand::Clear {
+                        peer,
+                        confirm: arg.trim() == "yes",
+                    });
+                }
+                None => self.status = "select a conversation first".into(),
+            },
+            "wipe" => {
+                let _ = self.commands.send(UiCommand::Wipe {
+                    confirm: arg.trim() == "yes",
+                });
+            }
             "mouse" => {
                 self.mouse = !self.mouse;
                 self.status = if self.mouse {
@@ -1097,7 +1125,9 @@ impl Ui {
             ("/peers  /whoami", "who is around · your own key"),
             ("/mouse", "hand the mouse back so you can select and copy text"),
             ("/leave", "sign yourself out of the selected room"),
-            ("/forget", "delete a conversation from this machine — no undo"),
+            ("/clear", "empty this conversation but keep the contact"),
+            ("/forget", "delete a conversation and the contact — no undo"),
+            ("/wipe", "delete every conversation on this machine"),
             ("/quit", "leave"),
             ("", ""),
             ("→ ✉ !", "sent over the wire · left on the hub · went nowhere"),
