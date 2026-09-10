@@ -17,7 +17,7 @@ you ── QUIC/TLS 1.3, hole-punched ──────────────
 ## Quick start
 
 ```sh
-cargo install --git https://github.com/<you>/wicara wicara
+cargo install --git https://github.com/satyaadhiyaksaardy/wicara wicara
 # or grab a binary from the Releases page
 
 wicara id                       # prints your EndpointId — this is your address
