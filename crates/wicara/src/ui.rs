@@ -33,6 +33,7 @@ pub struct Entry {
     pub reply_to: Option<MessageId>,
     /// `(emoji, count, whether you are one of them)`.
     pub reactions: Vec<(String, usize, bool)>,
+    pub attachment: Option<Attach>,
 }
 
 /// A room as the verified chain says it stands.
@@ -43,6 +44,18 @@ pub struct RoomView {
     /// False once you have been kicked — the room stays visible with its
     /// history, but you can no longer post to it.
     pub joined: bool,
+}
+
+/// A file hanging off a message.
+#[derive(Debug, Clone)]
+pub struct Attach {
+    pub name: String,
+    pub size: u64,
+    /// Shown short, so "the hashes match" is something a viewer can check
+    /// against the sender's screen rather than take on trust.
+    pub hash: [u8; 32],
+    /// Where it landed on this machine, once the bytes arrived and matched.
+    pub path: Option<String>,
 }
 
 /// Pushed in by the network side.
@@ -71,6 +84,12 @@ pub enum UiEvent {
     Log {
         peer: [u8; 32],
         entries: Vec<Entry>,
+    },
+    /// Progress on an attachment, in either direction.
+    Transfer {
+        id: MessageId,
+        done: u64,
+        total: u64,
     },
     /// A room appeared or its membership changed.
     Room {
@@ -113,6 +132,10 @@ pub enum UiCommand {
     },
     Nick(String),
     Room(RoomCommand),
+    SendFile {
+        peer: [u8; 32],
+        path: String,
+    },
     Quit,
 }
 
@@ -176,6 +199,8 @@ pub struct Ui {
     /// Wrapped chat lines scrolled up from the bottom; 0 pins to the newest.
     scroll: usize,
     status: String,
+    /// Attachments in flight, by message id.
+    transfers: HashMap<MessageId, (u64, u64)>,
     commands: mpsc::UnboundedSender<UiCommand>,
 }
 
@@ -197,6 +222,7 @@ impl Ui {
             caret: 0,
             scroll: 0,
             status: "waiting for peers".into(),
+            transfers: HashMap::new(),
             commands,
         }
     }
@@ -250,6 +276,13 @@ impl Ui {
                 }
                 if selected {
                     self.scroll = 0;
+                }
+            }
+            UiEvent::Transfer { id, done, total } => {
+                if done >= total {
+                    self.transfers.remove(&id);
+                } else {
+                    self.transfers.insert(id, (done, total));
                 }
             }
             UiEvent::Room { id, view } => self.peer_mut(id).room = Some(view),
@@ -451,6 +484,16 @@ impl Ui {
             }
             "nick" => self.status = "usage: /nick <name>".into(),
             "room" => self.room_command(arg.trim()),
+            "send" if !arg.trim().is_empty() => match self.selected_key() {
+                Some(peer) => {
+                    let _ = self.commands.send(UiCommand::SendFile {
+                        peer,
+                        path: arg.trim().to_string(),
+                    });
+                }
+                None => self.status = "select a peer first".into(),
+            },
+            "send" => self.status = "usage: /send <path>".into(),
             other => self.status = format!("unknown command /{other}"),
         }
         true
@@ -523,7 +566,7 @@ impl Ui {
     fn hints(&self) -> &'static str {
         match self.focus {
             Focus::Chat => "  ↑↓ pick · r reply · e edit · d delete · 1-5 react",
-            _ => "  tab focus · enter send · /peers /whoami /nick /room · ^c quit",
+            _ => "  tab · enter · /peers /whoami /nick /room /send · ^c quit",
         }
     }
 
@@ -600,7 +643,32 @@ impl Ui {
 
             let prefix = format!("{who}: ");
             let body_width = width.saturating_sub(prefix.width()).max(8);
-            if entry.deleted {
+            if let Some(file) = &entry.attachment {
+                let state = match (self.transfers.get(&entry.id), &file.path) {
+                    (Some((done, total)), _) => progress_bar(*done, *total),
+                    (None, Some(path)) => format!("saved to {path}"),
+                    (None, None) => "waiting for the bytes".into(),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.clone(), Style::new().fg(colour)),
+                    Span::styled(
+                        format!(
+                            "📎 {} · {} · blake3 {}",
+                            file.name,
+                            human(file.size),
+                            file.hash[..4]
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        ),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("{:w$}{state}", "", w = prefix.width()),
+                    Style::new().fg(Color::DarkGray),
+                )));
+            } else if entry.deleted {
                 lines.push(Line::from(vec![
                     Span::styled(prefix.clone(), Style::new().fg(colour)),
                     Span::styled("(deleted)", Style::new().fg(Color::DarkGray)),
@@ -721,6 +789,38 @@ impl Ui {
             })
             .title(title)
     }
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+fn progress_bar(done: u64, total: u64) -> String {
+    const WIDTH: usize = 20;
+    let filled = if total == 0 {
+        0
+    } else {
+        (done as u128 * WIDTH as u128 / total.max(1) as u128) as usize
+    }
+    .min(WIDTH);
+    format!(
+        "[{}{}] {}/{}",
+        "=".repeat(filled),
+        " ".repeat(WIDTH - filled),
+        human(done),
+        human(total)
+    )
 }
 
 fn first_line(text: &str, width: usize) -> String {
@@ -856,7 +956,22 @@ mod tests {
             deleted: false,
             reply_to: None,
             reactions: Vec::new(),
+            attachment: None,
         }
+    }
+
+    #[test]
+    fn sizes_and_progress_read_sensibly() {
+        assert_eq!(human(512), "512 B");
+        assert_eq!(human(1024), "1.0 KiB");
+        assert_eq!(human(1536), "1.5 KiB");
+        assert_eq!(human(3 * 1024 * 1024), "3.0 MiB");
+        assert!(progress_bar(0, 100).starts_with("[                    ]"));
+        assert!(progress_bar(50, 100).starts_with("[==========          ]"));
+        assert!(progress_bar(100, 100).starts_with("[====================]"));
+        // A peer that lies about the size must not panic the renderer.
+        assert!(progress_bar(200, 100).starts_with("[====================]"));
+        assert!(progress_bar(5, 0).starts_with("["));
     }
 
     fn id(sender: u8, seq: u64) -> MessageId {

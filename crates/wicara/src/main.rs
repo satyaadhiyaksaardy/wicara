@@ -1,6 +1,7 @@
 //! wicara — a terminal messenger where a contact is a public key, not a phone number.
 
 mod hub;
+mod files;
 mod identity;
 mod store;
 mod ui;
@@ -86,9 +87,10 @@ struct App {
     hub: Option<Arc<Hub>>,
     /// The long-lived X25519 key others seal offline messages to.
     prekey: Arc<StaticSecret>,
-    /// Peers with a live connection right now. What decides whether an op goes
-    /// down the wire or into the mailbox.
-    live: Arc<Mutex<HashSet<[u8; 32]>>>,
+    home: Arc<PathBuf>,
+    /// Live connections, which is both what decides whether an op goes down the
+    /// wire or into the mailbox, and where an attachment finds its stream.
+    live: Arc<Mutex<HashMap<[u8; 32], Connection>>>,
     prekeys: Arc<Mutex<HashMap<[u8; 32], VerifiedPrekey>>>,
     /// Rooms as their verified chains say they stand. Nothing here was taken
     /// on the hub's word.
@@ -178,6 +180,12 @@ impl App {
                 deleted: m.deleted,
                 reply_to: m.reply_to,
                 reactions: m.reactions,
+                attachment: m.attachment.map(|a| ui::Attach {
+                    name: a.name,
+                    size: a.size,
+                    hash: a.hash,
+                    path: a.path,
+                }),
             })
             .collect();
         let _ = self.events.send(UiEvent::Log { peer, entries });
@@ -205,7 +213,7 @@ async fn main() -> Result<()> {
             init_logging(&home)?;
             let me = *secret.public().as_bytes();
             let store = Store::open(&home.join("messages.db"), vault, me)?;
-            run(secret, store, connect, relay_only, nick, hub).await
+            run(home, secret, store, connect, relay_only, nick, hub).await
         }
     }
 }
@@ -228,6 +236,7 @@ fn init_logging(home: &Path) -> Result<()> {
 }
 
 async fn run(
+    home: PathBuf,
     secret: iroh::SecretKey,
     store: Store,
     connect: Option<String>,
@@ -277,7 +286,8 @@ async fn run(
         outbound: broadcast::channel(256).0,
         hub,
         prekey: Arc::new(prekey),
-        live: Arc::new(Mutex::new(HashSet::new())),
+        home: Arc::new(home.clone()),
+        live: Arc::new(Mutex::new(HashMap::new())),
         prekeys: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -350,6 +360,25 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
     while let Some(cmd) = commands.recv().await {
         let (peer, frame) = match cmd {
             UiCommand::Quit => return,
+            UiCommand::SendFile { peer, path } => {
+                let conn = app.live.lock().unwrap().get(&peer).cloned();
+                match conn {
+                    Some(conn) => {
+                        let app = app.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) =
+                                files::send(app.clone(), conn, peer, PathBuf::from(path)).await
+                            {
+                                app.status(format!("could not send that file: {err:#}"));
+                            }
+                        });
+                    }
+                    // The bytes need a live stream. Mailing a header for a file
+                    // that can never arrive would be worse than saying so.
+                    None => app.status("attachments need a live connection to that peer"),
+                }
+                continue;
+            }
             UiCommand::Room(cmd) => {
                 tokio::spawn(room_command(app.clone(), cmd));
                 continue;
@@ -448,7 +477,8 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
     };
 
     remember_nick(&app, &peer, &them);
-    app.live.lock().unwrap().insert(peer);
+    app.live.lock().unwrap().insert(peer, conn.clone());
+    tokio::spawn(files::accept_loop(app.clone(), conn.clone(), peer));
     let _ = app.events.send(UiEvent::Connected {
         peer,
         nick: them,
@@ -531,7 +561,7 @@ fn deliver(app: &App, conversation: [u8; 32], frame: Frame) {
 }
 
 fn deliver_to(app: &App, peer: [u8; 32], frame: Frame) {
-    if app.live.lock().unwrap().contains(&peer) {
+    if app.live.lock().unwrap().contains_key(&peer) {
         let _ = app.outbound.send((Some(peer), frame));
     } else if app.hub.is_some() {
         tokio::spawn(mail_to(app.clone(), peer, frame));

@@ -38,6 +38,17 @@ pub struct Message {
     pub reply_to: Option<MessageId>,
     /// `(emoji, count, whether this endpoint is one of them)`.
     pub reactions: Vec<(String, usize, bool)>,
+    pub attachment: Option<Attachment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Attachment {
+    pub name: String,
+    pub size: u64,
+    pub hash: [u8; 32],
+    /// Where it landed on this machine, once the bytes have all arrived and
+    /// the hash matched.
+    pub path: Option<String>,
 }
 
 impl Store {
@@ -173,6 +184,26 @@ impl Store {
                         deleted: false,
                         reply_to,
                         reactions: Vec::new(),
+                        attachment: None,
+                    });
+                }
+                Frame::File {
+                    name, size, hash, ..
+                } => {
+                    at.insert(id, messages.len());
+                    messages.push(Message {
+                        id,
+                        body: name.clone(),
+                        outbound: sender == self.me,
+                        deleted: false,
+                        reply_to: None,
+                        reactions: Vec::new(),
+                        attachment: Some(Attachment {
+                            name,
+                            size,
+                            hash,
+                            path: self.setting(&file_key(&id))?,
+                        }),
                     });
                 }
                 Frame::Edit { target, body, .. } if target.sender == sender => {
@@ -248,6 +279,12 @@ impl Store {
         Ok(out)
     }
 
+    /// Where an attachment ended up locally. Kept beside the ops so a restart
+    /// can still open it.
+    pub fn set_file_path(&self, id: &MessageId, path: &str) -> Result<()> {
+        self.set_setting(&file_key(id), path)
+    }
+
     /// Local, freely changeable display name. Kept beside the ops rather than in
     /// a config file so it travels with the encrypted store.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
@@ -280,6 +317,10 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn file_key(id: &MessageId) -> String {
+    format!("file:{id}")
 }
 
 #[cfg(test)]

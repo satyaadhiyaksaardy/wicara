@@ -135,6 +135,21 @@ pub enum Frame {
         room: [u8; 32],
         op: Box<Frame>,
     },
+    /// An attachment. Sent as the first frame of its own QUIC stream, with the
+    /// bytes following it raw — a bidirectional stream is already the thing
+    /// `iroh-blobs` wraps, and it is pre-1.0.
+    ///
+    /// The header carries everything the receiver needs, so it does not matter
+    /// whether the two streams arrive in order.
+    File {
+        id: MessageId,
+        /// Display name only. The receiver takes the file-name component of it
+        /// and nothing else — a peer does not get to choose a path here.
+        name: String,
+        size: u64,
+        /// BLAKE3 of the contents, checked on arrival.
+        hash: [u8; 32],
+    },
     /// "That room's log changed — go and look." A hint, never an authority:
     /// the receiver fetches the log from the hub and verifies it, and only the
     /// chain decides whether they are in the room. Forging one of these gets an
@@ -152,7 +167,8 @@ impl Frame {
             Frame::Chat { id, .. }
             | Frame::Edit { id, .. }
             | Frame::Delete { id, .. }
-            | Frame::React { id, .. } => Some(*id),
+            | Frame::React { id, .. }
+            | Frame::File { id, .. } => Some(*id),
             Frame::InRoom { op, .. } => op.id(),
         }
     }
@@ -266,6 +282,12 @@ mod tests {
                 target: id,
                 emoji: "👍".into(),
                 on: true,
+            },
+            Frame::File {
+                id,
+                size: 1234,
+                name: "holiday.jpg".into(),
+                hash: [7u8; 32],
             },
             Frame::InRoom {
                 room: [4u8; 32],
