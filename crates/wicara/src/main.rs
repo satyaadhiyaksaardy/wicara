@@ -395,12 +395,7 @@ fn dial_peer(app: &App, peer: [u8; 32], announce: bool) {
     if !app.dialing.lock().unwrap().insert(peer) {
         return;
     }
-    match app.store.lock().unwrap().setting(&nick_key(&peer)) {
-        Ok(nick) => {
-            let _ = app.events.send(UiEvent::Known { peer, nick });
-        }
-        Err(err) => tracing::warn!(%err, "could not read a remembered nickname"),
-    }
+    announce_peer(app, peer);
 
     let app = app.clone();
     tokio::spawn(async move {
@@ -458,13 +453,35 @@ fn nick_key(peer: &[u8; 32]) -> String {
     format!("nick:{}", ui::short(peer))
 }
 
+/// Your own name for a peer, kept apart from the one they send: a peer must not
+/// be able to overwrite what you decided to call them.
+fn alias_key(peer: &[u8; 32]) -> String {
+    format!("alias:{}", ui::short(peer))
+}
+
+/// Tells the UI both names a peer has: theirs and yours.
+fn announce_peer(app: &App, peer: [u8; 32]) {
+    let (nick, alias) = {
+        let store = app.store.lock().unwrap();
+        (
+            store.setting(&nick_key(&peer)).ok().flatten(),
+            // A cleared alias is stored as "", which must read back as absent.
+            store
+                .setting(&alias_key(&peer))
+                .ok()
+                .flatten()
+                .filter(|a| !a.is_empty()),
+        )
+    };
+    let _ = app.events.send(UiEvent::Known { peer, nick, alias });
+}
+
 /// Seeds the UI with every known peer and their stored history, so the log is
 /// already there before anyone comes online.
 fn replay_history(app: &App) -> Result<()> {
     let peers = app.store.lock().unwrap().peers()?;
     for peer in peers {
-        let nick = app.store.lock().unwrap().setting(&nick_key(&peer))?;
-        let _ = app.events.send(UiEvent::Known { peer, nick });
+        announce_peer(app, peer);
         app.send_log(peer)?;
     }
     Ok(())
@@ -493,6 +510,21 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                     // The bytes need a live stream. Mailing a header for a file
                     // that can never arrive would be worse than saying so.
                     None => app.status("attachments need a live connection to that peer"),
+                }
+                continue;
+            }
+            UiCommand::Name { peer, alias } => {
+                let saved = {
+                    let store = app.store.lock().unwrap();
+                    match &alias {
+                        Some(alias) => store.set_setting(&alias_key(&peer), alias),
+                        // An empty alias forgets it rather than storing a blank.
+                        None => store.set_setting(&alias_key(&peer), ""),
+                    }
+                };
+                match saved {
+                    Ok(()) => announce_peer(&app, peer),
+                    Err(err) => app.status(format!("could not save that name: {err}")),
                 }
                 continue;
             }

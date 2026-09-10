@@ -71,7 +71,10 @@ pub enum UiEvent {
     /// nickname is whatever it last called itself.
     Known {
         peer: [u8; 32],
+        /// What they call themselves.
         nick: Option<String>,
+        /// What you decided to call them, which wins.
+        alias: Option<String>,
     },
     Connected {
         peer: [u8; 32],
@@ -137,6 +140,12 @@ pub enum UiCommand {
         on: bool,
     },
     Nick(String),
+    /// Your own name for a peer. `None` forgets it and falls back to whatever
+    /// they call themselves.
+    Name {
+        peer: [u8; 32],
+        alias: Option<String>,
+    },
     /// Dial a peer without restarting.
     Connect([u8; 32]),
     Room(RoomCommand),
@@ -163,7 +172,11 @@ enum Pending {
 
 struct Peer {
     key: [u8; 32],
+    /// The name the peer sends in its hello. It picks this, so on its own it
+    /// proves nothing: two peers can claim the same one.
     nick: Option<String>,
+    /// The name you gave them with `/name`. Yours, so it is the trustworthy one.
+    alias: Option<String>,
     online: bool,
     path: String,
     log: Vec<Entry>,
@@ -177,10 +190,20 @@ struct Peer {
 
 impl Peer {
     fn label(&self) -> String {
-        match &self.room {
-            Some(room) => format!("#{}", room.name),
-            None => self.nick.clone().unwrap_or_else(|| short(&self.key)),
+        match (&self.room, &self.alias, &self.nick) {
+            (Some(room), _, _) => format!("#{}", room.name),
+            (None, Some(alias), _) => alias.clone(),
+            (None, None, Some(nick)) => nick.clone(),
+            (None, None, None) => short(&self.key),
         }
+    }
+
+    /// True when the displayed name is one you chose. An unnamed peer is shown
+    /// dimmed with a `?`, because the alternative — rendering a string the peer
+    /// picked as if it were their identity — is how you get impersonated by
+    /// someone who simply called themselves your friend's name.
+    fn named(&self) -> bool {
+        self.room.is_some() || self.alias.is_some() || self.nick.is_none()
     }
 
     fn subtitle(&self) -> String {
@@ -257,6 +280,7 @@ impl Ui {
             self.peers.push(Peer {
                 key,
                 nick: None,
+                alias: None,
                 online: false,
                 path: String::new(),
                 log: Vec::new(),
@@ -271,8 +295,10 @@ impl Ui {
 
     fn apply(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::Known { peer, nick } => {
-                self.peer_mut(peer).nick = nick;
+            UiEvent::Known { peer, nick, alias } => {
+                let p = self.peer_mut(peer);
+                p.nick = nick;
+                p.alias = alias;
             }
             UiEvent::Connected { peer, nick, path } => {
                 let p = self.peer_mut(peer);
@@ -555,6 +581,8 @@ impl Ui {
             }
             "nick" => self.status = "usage: /nick <name>".into(),
             "room" => self.room_command(arg.trim()),
+            "name" => self.name_command(arg.trim()),
+            "whois" => self.whois(),
             "mouse" => {
                 self.mouse = !self.mouse;
                 self.status = if self.mouse {
@@ -582,6 +610,47 @@ impl Ui {
             other => self.status = format!("unknown command /{other}"),
         }
         true
+    }
+
+    /// `/name <alias>` on the selected peer, or bare `/name` to forget it.
+    fn name_command(&mut self, arg: &str) {
+        let Some(peer) = self.peers.get_mut(self.sel) else {
+            self.status = "select a peer first".into();
+            return;
+        };
+        if peer.room.is_some() {
+            self.status = "rooms are named by whoever created them".into();
+            return;
+        }
+        let key = peer.key;
+        let alias = (!arg.is_empty()).then(|| arg.to_string());
+        peer.alias = alias.clone();
+        self.status = match &alias {
+            Some(alias) => format!("you now call {} {alias}", short(&key)),
+            None => format!("forgot your name for {}", short(&key)),
+        };
+        let _ = self.commands.send(UiCommand::Name { peer: key, alias });
+    }
+
+    /// The full key for the selected conversation, and both names it goes by.
+    /// The key is the only part that means anything.
+    fn whois(&mut self) {
+        let Some(peer) = self.peers.get(self.sel) else {
+            self.status = "select a peer first".into();
+            return;
+        };
+        let hex: String = peer.key.iter().map(|b| format!("{b:02x}")).collect();
+        self.status = match (&peer.room, &peer.alias, &peer.nick) {
+            (Some(room), _, _) => format!("#{} · {} members · {hex}", room.name, room.members),
+            (None, Some(alias), Some(nick)) => {
+                format!("{alias} (your name; they call themselves {nick}) · {hex}")
+            }
+            (None, Some(alias), None) => format!("{alias} (your name) · {hex}"),
+            (None, None, Some(nick)) => {
+                format!("{nick} — their claim, unverified; /name to set yours · {hex}")
+            }
+            (None, None, None) => format!("no name yet · {hex}"),
+        };
     }
 
     /// `/room create <name>`, `/room invite <endpoint-id>`, `/room kick <id>`.
@@ -654,7 +723,7 @@ impl Ui {
     fn hints(&self) -> &'static str {
         match self.focus {
             Focus::Chat => "  ↑↓ pick · r reply · e edit · d delete · 1-5 react",
-            _ => "  tab · enter · /connect /nick /room /send /mouse · ^c quit",
+            _ => "  tab · enter · /connect /name /whois /room /send · ^c quit",
         }
     }
 
@@ -672,10 +741,15 @@ impl Ui {
                     Some(_) => ("#", Color::DarkGray),
                     None => (dot, colour),
                 };
-                let mut spans = vec![
-                    Span::styled(format!("{dot} "), Style::new().fg(colour)),
-                    Span::raw(p.label()),
-                ];
+                let mut spans = vec![Span::styled(format!("{dot} "), Style::new().fg(colour))];
+                if p.named() {
+                    spans.push(Span::raw(p.label()));
+                } else {
+                    // Their claim, not your decision. Shown so it cannot be
+                    // mistaken for a name you verified.
+                    spans.push(Span::styled(p.label(), Style::new().fg(Color::DarkGray)));
+                    spans.push(Span::styled("?", Style::new().fg(Color::Yellow)));
+                }
                 if p.unread > 0 {
                     spans.push(Span::styled(
                         format!(" ({})", p.unread),
@@ -713,12 +787,28 @@ impl Ui {
         let mut owners: Vec<usize> = Vec::new();
         // Where the cursor's message starts and ends, so it can be scrolled to.
         let mut cursor_span = (0usize, 0usize);
+        let mut last_day = None;
         for (i, entry) in peer.log.iter().enumerate() {
+            if let Some(date) = day(entry.id.ts_ms)
+                && last_day != Some(date)
+            {
+                last_day = Some(date);
+                let label = day_label(date);
+                let rule = "─".repeat(width.saturating_sub(label.width() + 4) / 2);
+                lines.push(Line::from(Span::styled(
+                    format!("{rule} {label} {rule}"),
+                    Style::new().fg(Color::DarkGray),
+                )));
+                owners.push(usize::MAX);
+            }
             let start = lines.len();
             let (who, colour) = if entry.outbound {
-                (self.nickname.as_str(), Color::Cyan)
+                (self.nickname.clone(), Color::Cyan)
+            } else if peer.named() {
+                (peer.label(), Color::Magenta)
             } else {
-                (peer.nick.as_deref().unwrap_or("them"), Color::Magenta)
+                // Dimmed, because this is what they call themselves.
+                (peer.label(), Color::DarkGray)
             };
 
             if let Some(target) = entry.reply_to {
@@ -733,7 +823,15 @@ impl Ui {
                 )));
             }
 
-            let prefix = format!("{who}: ");
+            let stamp = clock(entry.id.ts_ms);
+            let prefix = format!("{stamp} {who}: ");
+            // The clock stays out of the way; the name carries the colour.
+            let head = || {
+                vec![
+                    Span::styled(format!("{stamp} "), Style::new().fg(Color::DarkGray)),
+                    Span::styled(format!("{who}: "), Style::new().fg(colour)),
+                ]
+            };
             let body_width = width.saturating_sub(prefix.width()).max(8);
             if let Some(file) = &entry.attachment {
                 let state = match (self.transfers.get(&entry.id), &file.path) {
@@ -741,8 +839,8 @@ impl Ui {
                     (None, Some(path)) => format!("saved to {path}"),
                     (None, None) => "waiting for the bytes".into(),
                 };
-                lines.push(Line::from(vec![
-                    Span::styled(prefix.clone(), Style::new().fg(colour)),
+                let mut spans = head();
+                spans.push(
                     Span::styled(
                         format!(
                             "📎 {} · {} · blake3 {}",
@@ -755,20 +853,20 @@ impl Ui {
                         ),
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
-                ]));
+                );
+                lines.push(Line::from(spans));
                 lines.push(Line::from(Span::styled(
                     format!("{:w$}{state}", "", w = prefix.width()),
                     Style::new().fg(Color::DarkGray),
                 )));
             } else if entry.deleted {
-                lines.push(Line::from(vec![
-                    Span::styled(prefix.clone(), Style::new().fg(colour)),
-                    Span::styled("(deleted)", Style::new().fg(Color::DarkGray)),
-                ]));
+                let mut spans = head();
+                spans.push(Span::styled("(deleted)", Style::new().fg(Color::DarkGray)));
+                lines.push(Line::from(spans));
             } else {
                 for (n, chunk) in wrap(&entry.body, body_width).into_iter().enumerate() {
                     let mut spans = if n == 0 {
-                        vec![Span::styled(prefix.clone(), Style::new().fg(colour))]
+                        head()
                     } else {
                         vec![Span::raw(format!("{:w$}", "", w = prefix.width()))]
                     };
@@ -829,7 +927,11 @@ impl Ui {
         }
         self.chat_rows = rows;
 
-        let title = format!("{} — {}", peer.label(), peer.subtitle());
+        let title = if peer.named() {
+            format!("{} — {}", peer.label(), peer.subtitle())
+        } else {
+            format!("{}? — unverified name — {}", peer.label(), peer.subtitle())
+        };
         frame.render_widget(
             Paragraph::new(view).block(
                 Block::default()
@@ -953,6 +1055,31 @@ fn byte_at_column(text: &str, column: usize) -> usize {
         width += c.width().unwrap_or(0);
     }
     text.len()
+}
+
+/// `MessageId` has carried a timestamp since the first milestone; this is where
+/// it finally gets used. The sender's clock is not trusted for ordering — `seq`
+/// does that — so this is a display hint and nothing more.
+fn clock(ts_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms as i64)
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|| "--:--".into())
+}
+
+/// The day a message landed on, for the separator between them.
+fn day(ts_ms: u64) -> Option<chrono::NaiveDate> {
+    chrono::DateTime::from_timestamp_millis(ts_ms as i64)
+        .map(|t| t.with_timezone(&chrono::Local).date_naive())
+}
+
+fn day_label(date: chrono::NaiveDate) -> String {
+    let today = chrono::Local::now().date_naive();
+    match (today - date).num_days() {
+        0 => "today".into(),
+        1 => "yesterday".into(),
+        2..=6 => date.format("%A").to_string(),
+        _ => date.format("%A, %e %B").to_string().replace("  ", " "),
+    }
 }
 
 fn parse_key(hex: &str) -> Option<[u8; 32]> {
@@ -1292,8 +1419,8 @@ mod tests {
     #[test]
     fn clicks_land_on_whatever_was_drawn_under_them() {
         let (mut ui, _rx) = ui();
-        ui.apply(UiEvent::Known { peer: [1; 32], nick: Some("one".into()) });
-        ui.apply(UiEvent::Known { peer: [2; 32], nick: Some("two".into()) });
+        ui.apply(UiEvent::Known { peer: [1; 32], nick: Some("one".into()), alias: None });
+        ui.apply(UiEvent::Known { peer: [2; 32], nick: Some("two".into()), alias: None });
         // Pretend a frame was drawn: 20-wide sidebar, chat beside it, input below.
         ui.peers_area = Rect { x: 0, y: 0, width: 20, height: 10 };
         ui.chat_area = Rect { x: 20, y: 0, width: 40, height: 10 };
@@ -1381,6 +1508,57 @@ mod tests {
     }
 
     #[test]
+    fn a_name_you_chose_outranks_the_one_they_claim() {
+        let (mut ui, mut rx) = ui();
+        let peer = [7u8; 32];
+
+        // Nothing known: fall back to the key, which is at least true.
+        ui.apply(UiEvent::Known { peer, nick: None, alias: None });
+        assert_eq!(ui.peers[0].label(), short(&peer));
+        assert!(ui.peers[0].named(), "a key is not a claim");
+
+        // They introduce themselves. That is a claim, not a fact.
+        ui.apply(UiEvent::Known { peer, nick: Some("bob".into()), alias: None });
+        assert_eq!(ui.peers[0].label(), "bob");
+        assert!(!ui.peers[0].named(), "an unverified name must be marked");
+
+        // You name them. Yours wins, and the display is trusted again.
+        for c in "/name Bob from work".chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(UiCommand::Name { peer, alias: Some("Bob from work".into()) })
+        );
+        assert_eq!(ui.peers[0].label(), "Bob from work");
+        assert!(ui.peers[0].named());
+
+        // An impostor cannot take the name over by claiming it.
+        ui.apply(UiEvent::Known {
+            peer,
+            nick: Some("Bob from work".into()),
+            alias: Some("Bob from work".into()),
+        });
+        assert_eq!(ui.peers[0].label(), "Bob from work");
+
+        // whois always shows the key, which is the part that means something.
+        for c in "/whois".chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(ui.status.contains(&"07".repeat(32)), "{}", ui.status);
+
+        // Bare /name forgets it and the claim goes back to being a claim.
+        for c in "/name".chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(rx.try_recv(), Ok(UiCommand::Name { peer, alias: None }));
+        assert!(!ui.peers[0].named());
+    }
+
+    #[test]
     fn connect_takes_an_endpoint_id_and_rejects_junk() {
         let (mut ui, mut rx) = ui();
         let peer = [9u8; 32];
@@ -1419,6 +1597,7 @@ mod tests {
         ui.apply(UiEvent::Known {
             peer: member,
             nick: None,
+            alias: None,
         });
         for c in format!("/room invite {member_hex}").chars() {
             press(&mut ui, c);
