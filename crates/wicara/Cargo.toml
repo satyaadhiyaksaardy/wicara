@@ -1,0 +1,18 @@
+[package]
+name = "wicara"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+data-encoding.workspace = true
+directories.workspace = true
+ed25519-dalek.workspace = true
+iroh.workspace = true
+rpassword.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wicara-core.workspace = true

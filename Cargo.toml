@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/wicara-core", "crates/wicara"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/satya/wicara"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+blake3 = "1.8.7"
+chacha20poly1305 = "0.11.0"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+data-encoding = "2.11.1"
+directories = "6.0.0"
+ed25519-dalek = "3.0.0"
+iroh = "1.2.0"
+postcard = { version = "1.1.3", features = ["alloc"] }
+getrandom = "0.3.4"
+rpassword = "7.5.4"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+tracing = "0.1"
+zeroize = "1.9.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wicara-core = { path = "crates/wicara-core" }
+
+[profile.release]
+strip = true
