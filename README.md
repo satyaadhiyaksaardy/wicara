@@ -207,6 +207,7 @@ no server involved at all.
 | DHT room discovery | rooms here are small and explicit |
 | Live audio recording | cross-platform capture collides with the Windows and macOS builds |
 | LoRa / radio mesh | a future project |
+| Homebrew tap, apt repo, Scoop bucket | signing keys and repo metadata to keep alive, for what `cargo install --git` and a release download already do |
 
 ## Running your own hub
 
