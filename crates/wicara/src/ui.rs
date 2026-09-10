@@ -128,6 +128,8 @@ pub enum UiEvent {
         done: u64,
         total: u64,
     },
+    /// A conversation was deleted from this machine.
+    Forgotten { peer: [u8; 32] },
     /// A room appeared or its membership changed.
     Room {
         id: [u8; 32],
@@ -140,6 +142,7 @@ pub enum UiEvent {
 #[derive(Debug, PartialEq)]
 pub enum RoomCommand {
     Create(String),
+    Leave { room: [u8; 32] },
     Invite { room: [u8; 32], member: [u8; 32] },
     Kick { room: [u8; 32], member: [u8; 32] },
 }
@@ -176,6 +179,9 @@ pub enum UiCommand {
     },
     /// Dial a peer without restarting.
     Connect([u8; 32]),
+    /// Delete a conversation from this machine. Local, and irreversible.
+    /// `confirm: false` only asks what would go.
+    Forget { peer: [u8; 32], confirm: bool },
     Room(RoomCommand),
     SendFile {
         peer: [u8; 32],
@@ -377,6 +383,20 @@ impl Ui {
                 } else {
                     self.transfers.insert(id, (done, total));
                 }
+            }
+            UiEvent::Forgotten { peer } => {
+                self.peers.retain(|p| p.key != peer);
+                // Indices shifted, so the lookup has to be rebuilt rather than
+                // patched.
+                self.index = self
+                    .peers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (p.key, i))
+                    .collect();
+                self.sel = self.sel.min(self.peers.len().saturating_sub(1));
+                self.scroll = 0;
+                self.delivery.clear();
             }
             UiEvent::Room { id, view } => self.peer_mut(id).room = Some(view),
             UiEvent::Status(s) => self.status = s,
@@ -635,6 +655,16 @@ impl Ui {
             "name" => self.name_command(arg.trim()),
             "whois" => self.whois(),
             "help" => self.help = true,
+            "leave" => match self.peers.get(self.sel) {
+                Some(p) if p.room.is_some() => {
+                    let _ = self
+                        .commands
+                        .send(UiCommand::Room(RoomCommand::Leave { room: p.key }));
+                }
+                Some(_) => self.status = "/leave is for rooms — use /forget for a peer".into(),
+                None => self.status = "select a room first".into(),
+            },
+            "forget" => self.forget_command(arg.trim()),
             "mouse" => {
                 self.mouse = !self.mouse;
                 self.status = if self.mouse {
@@ -682,6 +712,22 @@ impl Ui {
             None => format!("forgot your name for {}", short(&key)),
         };
         let _ = self.commands.send(UiCommand::Name { peer: key, alias });
+    }
+
+    /// Deleting is irreversible, so a bare `/forget` only says what would go;
+    /// `/forget yes` is the one that does it.
+    fn forget_command(&mut self, arg: &str) {
+        let Some(peer) = self.peers.get(self.sel) else {
+            self.status = "select a conversation first".into();
+            return;
+        };
+        let key = peer.key;
+        // The store knows what is actually there, so the warning comes back
+        // from it rather than being guessed at here.
+        let _ = self.commands.send(UiCommand::Forget {
+            peer: key,
+            confirm: arg == "yes",
+        });
     }
 
     /// The full key for the selected conversation, and both names it goes by.
@@ -1050,6 +1096,8 @@ impl Ui {
             ("/room create <name>", "start a room; then /room invite and /room kick"),
             ("/peers  /whoami", "who is around · your own key"),
             ("/mouse", "hand the mouse back so you can select and copy text"),
+            ("/leave", "sign yourself out of the selected room"),
+            ("/forget", "delete a conversation from this machine — no undo"),
             ("/quit", "leave"),
             ("", ""),
             ("→ ✉ !", "sent over the wire · left on the hub · went nowhere"),
@@ -1646,6 +1694,56 @@ mod tests {
         assert_eq!(ui.focus, Focus::Peers);
         ui.on_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(ui.focus, Focus::Chat);
+    }
+
+    #[test]
+    fn forget_asks_before_it_deletes() {
+        let (mut ui, mut rx) = ui();
+        let peer = [7u8; 32];
+        ui.apply(UiEvent::Known { peer, nick: Some("bob".into()), alias: None });
+
+        // A bare /forget only warns.
+        for c in "/forget".chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(UiCommand::Forget { peer, confirm: false }),
+            "a bare /forget only asks"
+        );
+        assert_eq!(ui.peers.len(), 1);
+
+        // Confirming does.
+        for c in "/forget yes".chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(rx.try_recv(), Ok(UiCommand::Forget { peer, confirm: true }));
+
+        // The peer only leaves the list when the store says it is gone.
+        assert_eq!(ui.peers.len(), 1);
+        ui.apply(UiEvent::Forgotten { peer });
+        assert!(ui.peers.is_empty());
+        assert_eq!(ui.sel, 0, "selection must not dangle past the end");
+    }
+
+    #[test]
+    fn forgetting_keeps_the_peer_index_consistent() {
+        let (mut ui, _rx) = ui();
+        for n in [1u8, 2, 3] {
+            ui.apply(UiEvent::Known { peer: [n; 32], nick: None, alias: None });
+        }
+        ui.sel = 2;
+        ui.apply(UiEvent::Forgotten { peer: [1; 32] });
+        assert_eq!(ui.peers.len(), 2);
+        // The survivors keep working: a log for the last one must still land.
+        ui.apply(UiEvent::Log {
+            peer: [3; 32],
+            entries: vec![entry(id(3, 1), "still here", false)],
+        });
+        let three = ui.peers.iter().find(|p| p.key == [3u8; 32]).unwrap();
+        assert_eq!(three.log.len(), 1, "index rebuilt correctly after removal");
     }
 
     #[test]

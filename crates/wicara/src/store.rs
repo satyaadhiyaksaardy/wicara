@@ -326,6 +326,47 @@ impl Store {
         self.set_setting(&file_key(id), path)
     }
 
+    /// What a `/forget` would destroy, so it can be shown before it happens.
+    pub fn forget_preview(&self, peer: &[u8; 32]) -> Result<(usize, usize)> {
+        let msgs = self.history(peer, usize::MAX)?;
+        let files = msgs
+            .iter()
+            .filter(|m| m.attachment.as_ref().is_some_and(|a| a.path.is_some()))
+            .count();
+        Ok((msgs.len(), files))
+    }
+
+    /// Removes a conversation from this machine: every op, the room log if it
+    /// is one, the names, and the record of any files it brought.
+    ///
+    /// Local only, and irreversible. The other side keeps its copy — there is
+    /// no way to reach into someone else's disk, and pretending otherwise would
+    /// be the dishonest kind of "delete for everyone".
+    ///
+    /// Returns the attachment paths so the caller can remove the files too.
+    pub fn forget(&mut self, peer: &[u8; 32], names: &[String]) -> Result<Vec<String>> {
+        let msgs = self.history(peer, usize::MAX)?;
+        let files: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| m.attachment.as_ref().and_then(|a| a.path.clone()))
+            .collect();
+
+        let tx = self.conn.transaction()?;
+        for msg in &msgs {
+            tx.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![file_key(&msg.id)],
+            )?;
+        }
+        for key in names {
+            tx.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        }
+        tx.execute("DELETE FROM ops WHERE peer = ?1", params![&peer[..]])?;
+        tx.execute("DELETE FROM rooms WHERE id = ?1", params![&peer[..]])?;
+        tx.commit()?;
+        Ok(files)
+    }
+
     /// Local, freely changeable display name. Kept beside the ops rather than in
     /// a config file so it travels with the encrypted store.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {

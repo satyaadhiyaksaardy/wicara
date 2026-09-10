@@ -28,6 +28,13 @@ pub enum RoomOp {
     Create { name: String },
     Invite { member: [u8; 32] },
     Kick { member: [u8; 32] },
+    /// A member signing themselves out.
+    ///
+    /// The only op an ordinary member may write, and it names no one: it can
+    /// remove its own author and nobody else. Without it the sole way out of a
+    /// room is for the founder to kick you, which leaves you stuck if they are
+    /// gone, unwilling, or lost their key.
+    Leave,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,21 +144,38 @@ pub fn verify_log(entries: &[RoomEntry]) -> Result<Room> {
             "room log entry {n} does not follow the one before it"
         );
         entry.verify_signature()?;
-        ensure!(
-            room.is_admin(&entry.author),
-            "room log entry {n} was written by someone who is not an admin"
-        );
+        // Authorisation is per op: admins act on other people, a member acts
+        // only on themselves.
         match &entry.op {
             RoomOp::Create { .. } => bail!("room log entry {n} creates a second room"),
             RoomOp::Invite { member } => {
+                ensure!(
+                    room.is_admin(&entry.author),
+                    "room log entry {n} was written by someone who is not an admin"
+                );
                 room.members.insert(*member);
             }
             RoomOp::Kick { member } => {
+                ensure!(
+                    room.is_admin(&entry.author),
+                    "room log entry {n} was written by someone who is not an admin"
+                );
                 ensure!(
                     member != &room.founder,
                     "room log entry {n} kicks the founder"
                 );
                 room.members.remove(member);
+            }
+            RoomOp::Leave => {
+                ensure!(
+                    room.members.contains(&entry.author),
+                    "room log entry {n} is someone leaving a room they are not in"
+                );
+                ensure!(
+                    entry.author != room.founder,
+                    "room log entry {n} is the founder leaving, which would orphan the room"
+                );
+                room.members.remove(&entry.author);
             }
         }
         room.head = entry.hash()?;
@@ -232,6 +256,56 @@ mod tests {
         assert!(!after.members.contains(&carol.verifying_key().to_bytes()));
         // The room's identity does not change when its membership does.
         assert_eq!(after.id, room.id);
+    }
+
+    #[test]
+    fn a_member_may_leave_but_only_themselves() {
+        let (alice, bob, carol, log) = build();
+        let room = verify_log(&log).unwrap();
+        let (bob_id, carol_id) = (
+            bob.verifying_key().to_bytes(),
+            carol.verifying_key().to_bytes(),
+        );
+
+        // Bob signs himself out. No admin involved.
+        let mut left = log.clone();
+        left.push(RoomEntry::new(&bob, room.head, 4, RoomOp::Leave).unwrap());
+        let after = verify_log(&left).unwrap();
+        assert!(!after.members.contains(&bob_id));
+        assert!(after.members.contains(&carol_id), "nobody else moved");
+
+        // Leaving twice is not a thing.
+        let mut twice = left.clone();
+        twice.push(RoomEntry::new(&bob, after.head, 5, RoomOp::Leave).unwrap());
+        assert!(verify_log(&twice).is_err());
+
+        // A stranger cannot "leave" a room to prove they were in it.
+        let mut stranger = log.clone();
+        stranger.push(RoomEntry::new(&key(9), room.head, 4, RoomOp::Leave).unwrap());
+        assert!(
+            verify_log(&stranger)
+                .unwrap_err()
+                .to_string()
+                .contains("not in")
+        );
+
+        // The founder leaving would leave the room with no admin.
+        let mut orphan = log.clone();
+        orphan.push(RoomEntry::new(&alice, room.head, 4, RoomOp::Leave).unwrap());
+        assert!(
+            verify_log(&orphan)
+                .unwrap_err()
+                .to_string()
+                .contains("orphan")
+        );
+
+        // And a Leave still cannot remove anyone else — the op names nobody, so
+        // the closest a member can get is kicking, which is refused.
+        let mut forged = log.clone();
+        forged.push(
+            RoomEntry::new(&bob, room.head, 4, RoomOp::Kick { member: carol_id }).unwrap(),
+        );
+        assert!(verify_log(&forged).is_err());
     }
 
     #[test]

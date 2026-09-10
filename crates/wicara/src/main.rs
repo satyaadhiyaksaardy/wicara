@@ -428,6 +428,35 @@ fn dial_peer(app: &App, peer: [u8; 32], announce: bool) {
     });
 }
 
+/// Deletes a conversation from this machine and drops the connection with it.
+///
+/// Local only: the other side keeps everything. Attachments go too, because a
+/// photo that arrived in a conversation you deleted is still that conversation.
+async fn forget(app: &App, peer: [u8; 32]) -> Result<()> {
+    // Closing first, so a message arriving mid-delete does not put the
+    // conversation straight back.
+    if let Some(conn) = app.live.lock().unwrap().remove(&peer) {
+        conn.close(0u32.into(), b"forgotten");
+    }
+    app.rooms.lock().unwrap().remove(&peer);
+    app.prekeys.lock().unwrap().remove(&peer);
+
+    let names = [nick_key(&peer), alias_key(&peer)];
+    let files = app.store.lock().unwrap().forget(&peer, &names)?;
+    let mut removed = 0;
+    for path in &files {
+        if tokio::fs::remove_file(path).await.is_ok() {
+            removed += 1;
+        }
+    }
+    let _ = app.events.send(UiEvent::Forgotten { peer });
+    app.status(format!(
+        "forgotten — {} attachment(s) deleted from this machine",
+        removed
+    ));
+    Ok(())
+}
+
 /// Peers do not reconnect by themselves. After a restart or a dropped network
 /// both sides sit idle, each waiting for the other to dial, and the only way
 /// back was to type `/connect` again. This redials anything known and not
@@ -525,6 +554,22 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                 match saved {
                     Ok(()) => announce_peer(&app, peer),
                     Err(err) => app.status(format!("could not save that name: {err}")),
+                }
+                continue;
+            }
+            UiCommand::Forget { peer, confirm } => {
+                if confirm {
+                    if let Err(err) = forget(&app, peer).await {
+                        app.status(format!("could not forget that: {err:#}"));
+                    }
+                } else {
+                    match app.store.lock().unwrap().forget_preview(&peer) {
+                        Ok((msgs, files)) => app.status(format!(
+                            "/forget yes  deletes {msgs} message(s) and {files} file(s) from \
+                             this machine — no undo. Their copy is untouched."
+                        )),
+                        Err(err) => app.status(format!("could not read that conversation: {err}")),
+                    }
                 }
                 continue;
             }
@@ -744,6 +789,7 @@ async fn room_command(app: App, cmd: ui::RoomCommand) {
         ui::RoomCommand::Kick { room, member } => {
             append(&app, Some(room), RoomOp::Kick { member }).await
         }
+        ui::RoomCommand::Leave { room } => append(&app, Some(room), RoomOp::Leave).await,
     };
     if let Err(err) = result {
         app.status(format!("room: {err:#}"));

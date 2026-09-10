@@ -175,7 +175,7 @@ Being exact about this is the point of the project, so here is the whole of it.
 |---|---|
 | Message content | from everyone except the sender and the recipient — the hub and the relay included |
 | Local history and identity key | at rest, behind your passphrase |
-| Room membership integrity | the hub cannot forge an invite or a kick |
+| Room membership integrity | the hub cannot forge an invite or a kick, and a member can only ever sign *themselves* out |
 | Message authorship | an op is only accepted under the key that authenticated, live or by mailbox |
 | Attachment integrity | BLAKE3, checked before the file is kept |
 | Display-name impersonation | a name you set outranks any name a peer claims, and unset names are marked `?` rather than shown as fact |
