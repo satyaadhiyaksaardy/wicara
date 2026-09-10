@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::SigningKey;
 use wicara_core::{
     e2e::{Envelope, SignedPrekey, VerifiedPrekey, mailbox_auth, seal},
+    room::{Room, RoomEntry, RoomId, verify_log},
     wire::now_ms,
 };
 use x25519_dalek::StaticSecret;
@@ -117,6 +118,43 @@ impl Hub {
             .context("clearing the mailbox")?;
         ensure!(res.status().is_success(), "hub returned {}", res.status());
         Ok(())
+    }
+
+    pub async fn put_room(&self, id: &RoomId, entries: &[RoomEntry]) -> Result<()> {
+        let res = self
+            .http
+            .put(format!("{}/room/{}", self.base, data_encoding::HEXLOWER.encode(id)))
+            .body(postcard::to_stdvec(entries)?)
+            .send()
+            .await
+            .context("publishing the room log")?;
+        ensure!(
+            res.status().is_success(),
+            "hub refused the room log: {} {}",
+            res.status(),
+            res.text().await.unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    /// Fetches a membership log **and replays it here**. The hub's copy is
+    /// evidence of nothing until the chain checks out, which is what stops it
+    /// from writing itself into a room.
+    pub async fn room(&self, id: &RoomId) -> Result<(Room, Vec<RoomEntry>)> {
+        let res = self
+            .http
+            .get(format!("{}/room/{}", self.base, data_encoding::HEXLOWER.encode(id)))
+            .send()
+            .await
+            .context("fetching the room log")?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("the hub has no log for that room");
+        }
+        ensure!(res.status().is_success(), "hub returned {}", res.status());
+        let entries: Vec<RoomEntry> = postcard::from_bytes(&res.bytes().await?)?;
+        let room = verify_log(&entries)?;
+        ensure!(&room.id == id, "the hub returned a log for a different room");
+        Ok((room, entries))
     }
 
     fn auth(&self) -> Result<reqwest::header::HeaderMap> {

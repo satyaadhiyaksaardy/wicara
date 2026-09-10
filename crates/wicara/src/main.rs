@@ -6,13 +6,13 @@ mod store;
 mod ui;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use iroh::{
     Endpoint, EndpointId,
@@ -21,7 +21,8 @@ use iroh::{
 use tokio::sync::{broadcast, mpsc};
 use wicara_core::{
     e2e::{Envelope, VerifiedPrekey},
-    wire::{Frame, read_frame, write_frame},
+    room::{Room, RoomEntry, RoomId, RoomOp, verify_log},
+    wire::{Frame, now_ms, read_frame, write_frame},
 };
 use x25519_dalek::StaticSecret;
 
@@ -89,6 +90,10 @@ struct App {
     /// down the wire or into the mailbox.
     live: Arc<Mutex<HashSet<[u8; 32]>>>,
     prekeys: Arc<Mutex<HashMap<[u8; 32], VerifiedPrekey>>>,
+    /// Rooms as their verified chains say they stand. Nothing here was taken
+    /// on the hub's word.
+    rooms: Arc<Mutex<HashMap<RoomId, Room>>>,
+    identity: ed25519_dalek::SigningKey,
 }
 
 impl App {
@@ -100,23 +105,61 @@ impl App {
         let _ = self.events.send(UiEvent::Status(msg.into()));
     }
 
-    /// Decrypts one mailbox envelope into the store. Returns the peer whose
-    /// conversation it belongs to, and whether it was new — a message can
-    /// legitimately arrive by both the live path and the mailbox, and the op
-    /// log's primary key is what makes the second one a no-op.
-    fn absorb(&self, envelope: &Envelope) -> Result<([u8; 32], bool)> {
-        let (plaintext, sender) = wicara_core::e2e::open(envelope, &self.prekey, &self.me)?;
-        let frame: Frame = postcard::from_bytes(&plaintext)?;
-        let Some(id) = frame.id() else {
-            bail!("a hello frame has no business in a mailbox");
-        };
-        // The envelope signature proved who sealed it; this ties the op's id to
-        // the same key, exactly as the live path does.
-        if id.sender != sender {
-            bail!("mailed op is minted under a key other than the one that signed it");
+    /// Files an incoming op under the right conversation, after checking the
+    /// sender was entitled to write there. Returns the conversation when the op
+    /// was new — an op that arrived twice, live and by mailbox, lands here
+    /// twice and is stored once.
+    async fn accept(&self, sender: [u8; 32], frame: Frame) -> Result<Option<[u8; 32]>> {
+        if let Frame::RoomUpdated { room } = frame {
+            let _ = fetch_room(self, room).await;
+            return Ok(None);
         }
-        let fresh = self.store.lock().unwrap().record(&sender, &frame)?;
-        Ok((sender, fresh))
+        let Some(id) = frame.id() else { return Ok(None) };
+        // Whoever carried it, the op must be minted under the key that
+        // authenticated: TLS on the live path, the envelope signature on the
+        // mailbox path.
+        ensure!(
+            id.sender == sender,
+            "op is minted under a key other than the sender's"
+        );
+
+        if let Frame::InRoom { room, .. } = &frame {
+            if !self.is_member(room, &sender) {
+                // Either the room is new to us or they were kicked. Ask the
+                // chain, not the sender.
+                fetch_room(self, *room).await?;
+                ensure!(
+                    self.is_member(room, &sender),
+                    "op for a room the chain does not put that sender in"
+                );
+            }
+            ensure!(
+                self.is_member(room, &self.me),
+                "op for a room this endpoint is not in"
+            );
+        }
+
+        let conversation = frame.conversation(sender);
+        let fresh = self
+            .store
+            .lock()
+            .unwrap()
+            .record(&conversation, &frame.unwrap_room())?;
+        Ok(fresh.then_some(conversation))
+    }
+
+    fn is_member(&self, room: &RoomId, who: &[u8; 32]) -> bool {
+        self.rooms
+            .lock()
+            .unwrap()
+            .get(room)
+            .is_some_and(|r| r.members.contains(who))
+    }
+
+    /// Decrypts one mailbox envelope and files it.
+    async fn absorb(&self, envelope: &Envelope) -> Result<Option<[u8; 32]>> {
+        let (plaintext, sender) = wicara_core::e2e::open(envelope, &self.prekey, &self.me)?;
+        self.accept(sender, postcard::from_bytes(&plaintext)?).await
     }
 
     /// Refolds the conversation and hands the UI the whole thing. One fold, in
@@ -221,11 +264,13 @@ async fn run(
     let identity = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
     let hub = hub_url
         .as_deref()
-        .map(|url| Hub::new(url, identity).map(Arc::new))
+        .map(|url| Hub::new(url, identity.clone()).map(Arc::new))
         .transpose()?;
 
     let app = App {
         me: *ep.id().as_bytes(),
+        identity: identity.clone(),
+        rooms: Arc::new(Mutex::new(HashMap::new())),
         store: Arc::new(Mutex::new(store)),
         nickname: Arc::new(Mutex::new(nickname)),
         events,
@@ -237,6 +282,7 @@ async fn run(
     };
 
     replay_history(&app)?;
+    load_rooms(&app)?;
     app.status(if relay_only {
         "relay-only: direct paths disabled"
     } else if app.hub.is_some() {
@@ -304,6 +350,10 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
     while let Some(cmd) = commands.recv().await {
         let (peer, frame) = match cmd {
             UiCommand::Quit => return,
+            UiCommand::Room(cmd) => {
+                tokio::spawn(room_command(app.clone(), cmd));
+                continue;
+            }
             UiCommand::Nick(nick) => {
                 *app.nickname.lock().unwrap() = nick.clone();
                 if let Err(err) = app.store.lock().unwrap().set_setting("nickname", &nick) {
@@ -355,13 +405,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
             continue;
         }
 
-        if app.live.lock().unwrap().contains(&peer) {
-            let _ = app.outbound.send((Some(peer), frame));
-        } else if app.hub.is_some() {
-            tokio::spawn(mail_to(app.clone(), peer, frame));
-        } else {
-            app.status("peer is offline and no hub is configured — saved locally only");
-        }
+        deliver(&app, peer, frame);
     }
 }
 
@@ -427,19 +471,13 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
                         path: describe_path(&conn).1,
                     });
                 }
-                Ok(Some(frame)) => {
-                    let Some(id) = frame.id() else { continue };
-                    // A peer may only mint ids under its own key. TLS proves who
-                    // it is; this ties the application-level id to that proof.
-                    // Whether the op is *allowed* is decided again by the store,
-                    // so the rule holds however the op arrived.
-                    if id.sender != peer {
-                        break Err(anyhow::anyhow!("peer minted an id under someone else's key"));
-                    }
-                    if app.store.lock().unwrap().record(&peer, &frame)? {
-                        app.send_log(peer)?;
-                    }
-                }
+                Ok(Some(frame)) => match app.accept(peer, frame).await {
+                    Ok(Some(conversation)) => app.send_log(conversation)?,
+                    Ok(None) => {}
+                    // A bad op is that peer's problem, not a reason to drop a
+                    // conversation that is otherwise fine.
+                    Err(err) => tracing::warn!(%err, "refused an incoming op"),
+                },
             },
             outgoing = outbound.recv() => {
                 let Ok((target, frame)) = outgoing else { continue };
@@ -460,6 +498,169 @@ fn remember_nick(app: &App, peer: &[u8; 32], nick: &str) {
     if let Err(err) = app.store.lock().unwrap().set_setting(&nick_key(peer), nick) {
         tracing::warn!(%err, "could not remember peer nickname");
     }
+}
+
+/// Routes one op: down the wire if that peer is connected, into their mailbox
+/// if not. A room fans out pairwise — one copy per member, each over their own
+/// connection or into their own mailbox.
+fn deliver(app: &App, conversation: [u8; 32], frame: Frame) {
+    let members = app.rooms.lock().unwrap().get(&conversation).map(|room| {
+        (
+            room.members.clone(),
+            room.members.contains(&app.me),
+        )
+    });
+
+    let Some((members, joined)) = members else {
+        return deliver_to(app, conversation, frame);
+    };
+    if !joined {
+        app.status("you are not in that room any more");
+        return;
+    }
+    let wrapped = Frame::InRoom {
+        room: conversation,
+        op: Box::new(frame),
+    };
+    for member in members {
+        if member == app.me {
+            continue;
+        }
+        deliver_to(app, member, wrapped.clone());
+    }
+}
+
+fn deliver_to(app: &App, peer: [u8; 32], frame: Frame) {
+    if app.live.lock().unwrap().contains(&peer) {
+        let _ = app.outbound.send((Some(peer), frame));
+    } else if app.hub.is_some() {
+        tokio::spawn(mail_to(app.clone(), peer, frame));
+    } else {
+        app.status("peer is offline and no hub is configured — saved locally only");
+    }
+}
+
+/// Appends one signed entry to a room's chain, verifies the result here, stores
+/// it, publishes it, and tells the members to go and look.
+async fn room_command(app: App, cmd: ui::RoomCommand) {
+    let result = match cmd {
+        ui::RoomCommand::Create(name) => append(&app, None, RoomOp::Create { name }).await,
+        ui::RoomCommand::Invite { room, member } => {
+            append(&app, Some(room), RoomOp::Invite { member }).await
+        }
+        ui::RoomCommand::Kick { room, member } => {
+            append(&app, Some(room), RoomOp::Kick { member }).await
+        }
+    };
+    if let Err(err) = result {
+        app.status(format!("room: {err:#}"));
+    }
+}
+
+async fn append(app: &App, room: Option<RoomId>, op: RoomOp) -> Result<()> {
+    let mut entries = match room {
+        Some(id) => app
+            .store
+            .lock()
+            .unwrap()
+            .rooms()?
+            .into_iter()
+            .find(|(known, _)| known == &id)
+            .map(|(_, log)| log)
+            .context("that room is not one this endpoint knows about")?,
+        None => Vec::new(),
+    };
+    let before: BTreeSet<[u8; 32]> = verify_log(&entries)
+        .map(|r| r.members)
+        .unwrap_or_default();
+    let prev = entries
+        .last()
+        .map(|e: &RoomEntry| e.hash())
+        .transpose()?
+        .unwrap_or([0u8; 32]);
+    entries.push(RoomEntry::new(&app.identity, prev, now_ms(), op)?);
+
+    // Verified here before it is stored or published: an entry this endpoint
+    // cannot itself accept has no business going to anyone else.
+    let verified = verify_log(&entries)?;
+    let id = verified.id;
+    // Whoever was in the room and whoever is in it now — so the person just
+    // kicked is told to go and check, and finds the chain agreeing.
+    let notify: BTreeSet<[u8; 32]> = before.union(&verified.members).copied().collect();
+
+    app.store.lock().unwrap().save_room(&id, &entries)?;
+    publish_room(app, verified, entries).await?;
+
+    for member in notify {
+        if member != app.me {
+            deliver_to(app, member, Frame::RoomUpdated { room: id });
+        }
+    }
+    Ok(())
+}
+
+/// Puts a verified room into the local state and the sidebar.
+fn show_room(app: &App, room: Room) -> Result<()> {
+    let id = room.id;
+    let view = ui::RoomView {
+        name: room.name.clone(),
+        members: room.members.len(),
+        joined: room.members.contains(&app.me),
+    };
+    app.rooms.lock().unwrap().insert(id, room);
+    let _ = app.events.send(UiEvent::Room { id, view });
+    app.send_log(id)
+}
+
+async fn publish_room(app: &App, room: Room, entries: Vec<RoomEntry>) -> Result<()> {
+    let id = room.id;
+    show_room(app, room)?;
+    if let Some(hub) = app.hub.clone() {
+        hub.put_room(&id, &entries).await?;
+    }
+    Ok(())
+}
+
+/// Fetches a room's log from the hub and replays it here. The hub's copy is a
+/// claim; the chain is the evidence, and `Hub::room` will not return a room it
+/// could not verify.
+async fn fetch_room(app: &App, id: RoomId) -> Result<()> {
+    let hub = app.hub.clone().context("no hub configured")?;
+    let (room, entries) = hub.room(&id).await?;
+    app.store.lock().unwrap().save_room(&id, &entries)?;
+    let joined = room.members.contains(&app.me);
+    let name = room.name.clone();
+    show_room(app, room)?;
+    app.status(if joined {
+        format!("#{name} membership updated")
+    } else {
+        format!("#{name}: you are no longer a member")
+    });
+    Ok(())
+}
+
+/// Replays every room this endpoint already knows, then asks the hub whether
+/// anything moved while it was away.
+fn load_rooms(app: &App) -> Result<()> {
+    // Bound first: a `for` loop holds the scrutinee's temporaries for the whole
+    // body, and `show_room` reaches for the same lock.
+    let stored = app.store.lock().unwrap().rooms()?;
+    for (id, entries) in stored {
+        match verify_log(&entries) {
+            Ok(room) if room.id == id => show_room(app, room)?,
+            Ok(_) => tracing::warn!("stored room log does not match its id"),
+            Err(err) => tracing::warn!(%err, "stored room log no longer verifies"),
+        }
+        if app.hub.is_some() {
+            let app = app.clone();
+            tokio::spawn(async move {
+                if let Err(err) = fetch_room(&app, id).await {
+                    tracing::warn!(%err, "could not refresh a room from the hub");
+                }
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The X25519 key others seal offline messages to. Long-lived and kept in the
@@ -521,15 +722,17 @@ async fn mailbox_loop(app: App) {
                 let mut touched = HashSet::new();
                 let mut arrived = 0;
                 for (row, envelope) in mail {
-                    match app.absorb(&envelope) {
-                        Ok((peer, fresh)) => {
+                    match app.absorb(&envelope).await {
+                        Ok(conversation) => {
                             collected.push(row);
-                            touched.insert(peer);
-                            arrived += usize::from(fresh);
+                            if let Some(conversation) = conversation {
+                                touched.insert(conversation);
+                                arrived += 1;
+                            }
                         }
-                        // Leave it on the hub rather than lose it; the TTL
-                        // sweep is the backstop.
-                        Err(err) => tracing::warn!(%err, "could not open a mailbox envelope"),
+                        // Leave it on the hub rather than lose it: the next
+                        // poll retries, and the TTL sweep is the backstop.
+                        Err(err) => tracing::warn!(%err, "could not accept a mailbox envelope"),
                     }
                 }
                 for peer in touched {

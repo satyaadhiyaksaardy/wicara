@@ -35,6 +35,16 @@ pub struct Entry {
     pub reactions: Vec<(String, usize, bool)>,
 }
 
+/// A room as the verified chain says it stands.
+#[derive(Debug, Clone)]
+pub struct RoomView {
+    pub name: String,
+    pub members: usize,
+    /// False once you have been kicked — the room stays visible with its
+    /// history, but you can no longer post to it.
+    pub joined: bool,
+}
+
 /// Pushed in by the network side.
 #[derive(Debug)]
 pub enum UiEvent {
@@ -62,7 +72,20 @@ pub enum UiEvent {
         peer: [u8; 32],
         entries: Vec<Entry>,
     },
+    /// A room appeared or its membership changed.
+    Room {
+        id: [u8; 32],
+        view: RoomView,
+    },
     Status(String),
+}
+
+/// What `/room` asked for.
+#[derive(Debug, PartialEq)]
+pub enum RoomCommand {
+    Create(String),
+    Invite { room: [u8; 32], member: [u8; 32] },
+    Kick { room: [u8; 32], member: [u8; 32] },
 }
 
 /// Pushed back out to the network side.
@@ -89,6 +112,7 @@ pub enum UiCommand {
         on: bool,
     },
     Nick(String),
+    Room(RoomCommand),
     Quit,
 }
 
@@ -115,11 +139,26 @@ struct Peer {
     unread: usize,
     /// Index into `log` of the message the chat cursor is on.
     cursor: usize,
+    /// Set when this conversation is a room rather than a person. A room id is
+    /// 32 bytes exactly like an endpoint id, which is why one list holds both.
+    room: Option<RoomView>,
 }
 
 impl Peer {
     fn label(&self) -> String {
-        self.nick.clone().unwrap_or_else(|| short(&self.key))
+        match &self.room {
+            Some(room) => format!("#{}", room.name),
+            None => self.nick.clone().unwrap_or_else(|| short(&self.key)),
+        }
+    }
+
+    fn subtitle(&self) -> String {
+        match &self.room {
+            Some(room) if !room.joined => "you are not in this room".into(),
+            Some(room) => format!("{} member(s)", room.members),
+            None if self.path.is_empty() => "offline".into(),
+            None => self.path.clone(),
+        }
     }
 }
 
@@ -172,6 +211,7 @@ impl Ui {
                 log: Vec::new(),
                 unread: 0,
                 cursor: 0,
+                room: None,
             });
             self.peers.len() - 1
         });
@@ -212,6 +252,7 @@ impl Ui {
                     self.scroll = 0;
                 }
             }
+            UiEvent::Room { id, view } => self.peer_mut(id).room = Some(view),
             UiEvent::Status(s) => self.status = s,
         }
     }
@@ -409,9 +450,47 @@ impl Ui {
                 self.status = format!("you are now {}", self.nickname);
             }
             "nick" => self.status = "usage: /nick <name>".into(),
+            "room" => self.room_command(arg.trim()),
             other => self.status = format!("unknown command /{other}"),
         }
         true
+    }
+
+    /// `/room create <name>`, `/room invite <endpoint-id>`, `/room kick <id>`.
+    /// Invite and kick act on the room the sidebar is on, so there is no room
+    /// id to paste as well as the member's.
+    fn room_command(&mut self, arg: &str) {
+        let (verb, rest) = arg.split_once(' ').unwrap_or((arg, ""));
+        let rest = rest.trim();
+        match verb {
+            "create" if !rest.is_empty() => {
+                let _ = self
+                    .commands
+                    .send(UiCommand::Room(RoomCommand::Create(rest.to_string())));
+            }
+            "invite" | "kick" => {
+                let Some(peer) = self.peers.get(self.sel) else {
+                    self.status = "select a room first".into();
+                    return;
+                };
+                if peer.room.is_none() {
+                    self.status = "select a room first — invite and kick act on it".into();
+                    return;
+                }
+                let room = peer.key;
+                match parse_key(rest) {
+                    Some(member) => {
+                        let _ = self.commands.send(UiCommand::Room(if verb == "invite" {
+                            RoomCommand::Invite { room, member }
+                        } else {
+                            RoomCommand::Kick { room, member }
+                        }));
+                    }
+                    None => self.status = format!("usage: /room {verb} <endpoint-id>"),
+                }
+            }
+            _ => self.status = "usage: /room create <name> | invite <id> | kick <id>".into(),
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -444,7 +523,7 @@ impl Ui {
     fn hints(&self) -> &'static str {
         match self.focus {
             Focus::Chat => "  ↑↓ pick · r reply · e edit · d delete · 1-5 react",
-            _ => "  tab focus · enter send · /peers /whoami /nick · ^c quit",
+            _ => "  tab focus · enter send · /peers /whoami /nick /room · ^c quit",
         }
     }
 
@@ -456,6 +535,11 @@ impl Ui {
             .map(|p| {
                 let dot = if p.online { "●" } else { "○" };
                 let colour = if p.online { Color::Green } else { Color::DarkGray };
+                let (dot, colour) = match &p.room {
+                    Some(room) if room.joined => ("#", Color::Blue),
+                    Some(_) => ("#", Color::DarkGray),
+                    None => (dot, colour),
+                };
                 let mut spans = vec![
                     Span::styled(format!("{dot} "), Style::new().fg(colour)),
                     Span::raw(p.label()),
@@ -523,14 +607,13 @@ impl Ui {
                 ]));
             } else {
                 for (n, chunk) in wrap(&entry.body, body_width).into_iter().enumerate() {
-                    lines.push(if n == 0 {
-                        Line::from(vec![
-                            Span::styled(prefix.clone(), Style::new().fg(colour)),
-                            Span::raw(chunk),
-                        ])
+                    let mut spans = if n == 0 {
+                        vec![Span::styled(prefix.clone(), Style::new().fg(colour))]
                     } else {
-                        Line::from(format!("{:w$}{chunk}", "", w = prefix.width()))
-                    });
+                        vec![Span::raw(format!("{:w$}", "", w = prefix.width()))]
+                    };
+                    spans.extend(mention_spans(&chunk, &self.nickname));
+                    lines.push(Line::from(spans));
                 }
             }
 
@@ -582,11 +665,7 @@ impl Ui {
             view.insert(0, Line::default());
         }
 
-        let title = if peer.path.is_empty() {
-            format!("{} — offline", peer.label())
-        } else {
-            format!("{} — {}", peer.label(), peer.path)
-        };
+        let title = format!("{} — {}", peer.label(), peer.subtitle());
         frame.render_widget(
             Paragraph::new(view).block(
                 Block::default()
@@ -651,6 +730,44 @@ fn first_line(text: &str, width: usize) -> String {
         Some(l) => l,
         None => String::new(),
     }
+}
+
+fn parse_key(hex: &str) -> Option<[u8; 32]> {
+    data_encoding::HEXLOWER_PERMISSIVE
+        .decode(hex.trim().as_bytes())
+        .ok()?
+        .as_slice()
+        .try_into()
+        .ok()
+}
+
+/// Splits a line so `@nickname` stands out, and stands out more when it is
+/// yours. Nicknames are local metadata, so this is a display convenience and
+/// nothing addresses anyone by it.
+fn mention_spans(text: &str, me: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        if at > 0 {
+            spans.push(Span::raw(rest[..at].to_string()));
+        }
+        let tail = &rest[at..];
+        let end = tail[1..]
+            .find(|c: char| c.is_whitespace() || c == ',' || c == '.')
+            .map_or(tail.len(), |i| i + 1);
+        let (mention, after) = tail.split_at(end);
+        let style = if mention[1..].eq_ignore_ascii_case(me) {
+            Style::new().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(mention.to_string(), style));
+        rest = after;
+    }
+    if !rest.is_empty() {
+        spans.push(Span::raw(rest.to_string()));
+    }
+    spans
 }
 
 /// Word wrap on display width, hard-splitting any word wider than the column.
@@ -907,6 +1024,64 @@ mod tests {
                 emoji: "👍".into(),
                 on: false
             })
+        );
+    }
+
+    #[test]
+    fn mentions_are_split_out_and_yours_looks_different() {
+        let spans = mention_spans("hey @satya and @bob, look", "satya");
+        let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, vec!["hey ", "@satya", " and ", "@bob", ", look"]);
+        assert_ne!(spans[1].style, spans[3].style, "your own mention stands out");
+        assert_eq!(mention_spans("no mentions", "satya").len(), 1);
+        assert_eq!(mention_spans("", "satya").len(), 0);
+    }
+
+    #[test]
+    fn room_commands_need_a_room_selected() {
+        let (mut ui, mut rx) = ui();
+        let member = [7u8; 32];
+        let member_hex = data_encoding::HEXLOWER.encode(&member);
+
+        for c in "/room create kitchen".chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(UiCommand::Room(RoomCommand::Create("kitchen".into())))
+        );
+
+        // Invite with a person selected, not a room.
+        ui.apply(UiEvent::Known {
+            peer: member,
+            nick: None,
+        });
+        for c in format!("/room invite {member_hex}").chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(ui.status.contains("select a room first"));
+        assert!(rx.try_recv().is_err());
+
+        // Now with the room selected.
+        let room = [1u8; 32];
+        ui.apply(UiEvent::Room {
+            id: room,
+            view: RoomView {
+                name: "kitchen".into(),
+                members: 1,
+                joined: true,
+            },
+        });
+        ui.sel = 1;
+        for c in format!("/room kick {member_hex}").chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(UiCommand::Room(RoomCommand::Kick { room, member }))
         );
     }
 

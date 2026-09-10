@@ -17,6 +17,7 @@ use std::{
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use wicara_core::{
+    room::{RoomEntry, RoomId},
     vault::VaultKey,
     wire::{Counter, Frame, MessageId},
 };
@@ -55,7 +56,8 @@ impl Store {
                  payload BLOB    NOT NULL,
                  PRIMARY KEY (sender, seq, ts_ms)
              );
-             CREATE INDEX IF NOT EXISTS ops_by_peer ON ops (peer, ts_ms);",
+             CREATE INDEX IF NOT EXISTS ops_by_peer ON ops (peer, ts_ms);
+             CREATE TABLE IF NOT EXISTS rooms (id BLOB PRIMARY KEY, log BLOB NOT NULL);",
         )?;
         let resume: i64 = conn
             .query_row(
@@ -215,6 +217,35 @@ impl Store {
 
         let skip = messages.len().saturating_sub(limit);
         Ok(messages.split_off(skip))
+    }
+
+    /// Keeps the room's log locally so membership survives a hub that is down
+    /// or hostile. It is re-verified on the way out, never trusted for being
+    /// on our own disk.
+    pub fn save_room(&self, id: &RoomId, entries: &[RoomEntry]) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO rooms (id, log) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET log = excluded.log",
+            params![&id[..], self.vault.seal(&postcard::to_stdvec(entries)?)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn rooms(&self) -> Result<Vec<(RoomId, Vec<RoomEntry>)>> {
+        let mut stmt = self.conn.prepare("SELECT id, log FROM rooms")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, log) = row?;
+            let id: RoomId = id
+                .as_slice()
+                .try_into()
+                .context("message store holds a malformed room id")?;
+            out.push((id, postcard::from_bytes(&self.vault.open(&log)?)?));
+        }
+        Ok(out)
     }
 
     /// Local, freely changeable display name. Kept beside the ops rather than in

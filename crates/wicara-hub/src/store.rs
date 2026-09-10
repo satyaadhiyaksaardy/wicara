@@ -31,7 +31,12 @@ impl HubStore {
                  blob        BLOB    NOT NULL
              );
              CREATE INDEX IF NOT EXISTS mail_by_recipient ON mail (recipient, id);
-             CREATE INDEX IF NOT EXISTS mail_by_age ON mail (received_ms);",
+             CREATE INDEX IF NOT EXISTS mail_by_age ON mail (received_ms);
+             CREATE TABLE IF NOT EXISTS rooms (
+                 id     BLOB    PRIMARY KEY,
+                 length INTEGER NOT NULL,
+                 blob   BLOB    NOT NULL
+             );",
         )?;
         Ok(Self(Mutex::new(conn)))
     }
@@ -113,6 +118,33 @@ impl HubStore {
         Ok(deleted)
     }
 
+    /// Stores a membership log verbatim, verifying nothing about it — that is
+    /// the clients' job and the reason this server cannot forge membership.
+    ///
+    /// The one rule is that a log may not get shorter. It costs no verification
+    /// and stops anyone who can reach the hub from erasing a room by PUTting a
+    /// one-entry chain over it.
+    pub fn put_room(&self, id: &[u8; 32], length: usize, blob: &[u8]) -> Result<bool> {
+        let rows = self.0.lock().unwrap().execute(
+            "INSERT INTO rooms (id, length, blob) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET length = excluded.length, blob = excluded.blob
+             WHERE excluded.length > rooms.length",
+            params![&id[..], length as i64, blob],
+        )?;
+        Ok(rows == 1)
+    }
+
+    pub fn room(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT blob FROM rooms WHERE id = ?1", params![&id[..]], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
     /// Undelivered mail is not storage anyone signed up to provide forever.
     pub fn sweep(&self, ttl: Duration) -> Result<usize> {
         let cutoff = now_ms().saturating_sub(ttl.as_millis() as u64) as i64;
@@ -192,6 +224,13 @@ mod tests {
         let stored: SignedPrekey = postcard::from_bytes(&store.prekey(&bob).unwrap().unwrap()).unwrap();
         assert_eq!(stored.created_ms, 2);
         assert!(stored.verify(&bob).is_ok());
+
+        // Rooms: a log may grow, never shrink.
+        let room_id = [42u8; 32];
+        assert!(store.put_room(&room_id, 3, b"three-entry log").unwrap());
+        assert!(store.put_room(&room_id, 5, b"five-entry log").unwrap());
+        assert!(!store.put_room(&room_id, 2, b"erased").unwrap());
+        assert_eq!(store.room(&room_id).unwrap().unwrap(), b"five-entry log");
 
         std::fs::remove_dir_all(&dir).ok();
     }

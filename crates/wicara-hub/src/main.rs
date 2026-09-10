@@ -6,7 +6,9 @@
 //!   one: clients check the signature against the EndpointId they already have.
 //! * **mailbox** — holds sealed envelopes for endpoints that are offline. It
 //!   cannot read them.
-//! * **room registry** — arrives in M4.
+//! * **room registry** — keeps signed membership logs. It cannot forge an
+//!   invite or a kick, because the client replays and verifies every chain it
+//!   is handed and believes nothing this server says about membership.
 //!
 //! It never carries live chat. It *does* learn who mails whom and when, and how
 //! large the message was. That is a real metadata leak and it belongs in the
@@ -26,7 +28,10 @@ use axum::{
     routing::{delete, get, put},
 };
 use clap::Parser;
-use wicara_core::e2e::{Envelope, SignedPrekey, mailbox_auth};
+use wicara_core::{
+    e2e::{Envelope, SignedPrekey, mailbox_auth},
+    room::{RoomEntry, verify_log},
+};
 
 use crate::store::HubStore;
 
@@ -82,6 +87,7 @@ async fn main() -> Result<()> {
         .route("/mail/{recipient}", axum::routing::post(post_mail))
         .route("/mail", get(get_mail))
         .route("/mail", delete(delete_mail))
+        .route("/room/{id}", put(put_room).get(get_room))
         .route("/health", get(|| async { "ok" }))
         .with_state(store);
 
@@ -167,6 +173,46 @@ async fn delete_mail(
     // simply not found.
     store.delete_mail(&me, &ids)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stores a room's membership log.
+///
+/// Deliberate deviation from the plan, which said the hub verifies nothing. A
+/// hub that verifies nothing accepts any blob under any id, so anyone able to
+/// reach it could PUT a thousand entries of garbage and permanently outrank the
+/// real log under the "must not shrink" rule. Verifying costs a millisecond and
+/// closes that off.
+///
+/// Verifying is not the same as being trusted: the client replays the chain
+/// again on the way in, and that is the check membership actually rests on.
+/// This one only stops the registry being spammed into uselessness.
+async fn put_room(State(store): Hub, Path(id): Path<String>, body: Bytes) -> Result<StatusCode, Error> {
+    let id = parse_endpoint(&id)?;
+    let entries: Vec<RoomEntry> = decode(&body)?;
+    // Enough verification to know the id is the one being claimed. Everything
+    // about membership is still the client's to check.
+    let room = verify_log(&entries).map_err(|e| Error(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if room.id != id {
+        return Err(Error(
+            StatusCode::BAD_REQUEST,
+            "log does not belong to that room id".into(),
+        ));
+    }
+    if store.put_room(&id, entries.len(), &body)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(Error(
+            StatusCode::CONFLICT,
+            "the stored log is at least this long already".into(),
+        ))
+    }
+}
+
+async fn get_room(State(store): Hub, Path(id): Path<String>) -> Result<Vec<u8>, Error> {
+    let id = parse_endpoint(&id)?;
+    store
+        .room(&id)?
+        .ok_or_else(|| Error(StatusCode::NOT_FOUND, "no such room".into()))
 }
 
 fn authenticate(headers: &HeaderMap) -> Result<[u8; 32], Error> {

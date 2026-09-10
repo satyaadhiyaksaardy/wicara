@@ -122,17 +122,54 @@ pub enum Frame {
         /// state the two ends can disagree about.
         on: bool,
     },
+    /// The same ops again, addressed to a room instead of to the peer carrying
+    /// them. A room id is 32 bytes, exactly like an endpoint id, so the store
+    /// files a room conversation the same way it files a 1:1 one and nothing
+    /// downstream had to change.
+    ///
+    /// Rooms are broadcast pairwise: each member gets their own copy over their
+    /// own connection, or in their own mailbox.
+    // ponytail: pairwise encryption, fine to roughly 20 members; a group key if
+    // rooms ever grow past that.
+    InRoom {
+        room: [u8; 32],
+        op: Box<Frame>,
+    },
+    /// "That room's log changed — go and look." A hint, never an authority:
+    /// the receiver fetches the log from the hub and verifies it, and only the
+    /// chain decides whether they are in the room. Forging one of these gets an
+    /// attacker nothing but a wasted fetch.
+    RoomUpdated {
+        room: [u8; 32],
+    },
 }
 
 impl Frame {
     /// The id of the op itself, for dedup. `Hello` carries none.
     pub fn id(&self) -> Option<MessageId> {
         match self {
-            Frame::Hello { .. } => None,
+            Frame::Hello { .. } | Frame::RoomUpdated { .. } => None,
             Frame::Chat { id, .. }
             | Frame::Edit { id, .. }
             | Frame::Delete { id, .. }
             | Frame::React { id, .. } => Some(*id),
+            Frame::InRoom { op, .. } => op.id(),
+        }
+    }
+
+    /// The conversation this op belongs to: a room, or the peer that carried it.
+    pub fn conversation(&self, peer: [u8; 32]) -> [u8; 32] {
+        match self {
+            Frame::InRoom { room, .. } => *room,
+            _ => peer,
+        }
+    }
+
+    /// Strips the room wrapper, so the store and the fold see one shape of op.
+    pub fn unwrap_room(self) -> Frame {
+        match self {
+            Frame::InRoom { op, .. } => *op,
+            other => other,
         }
     }
 }
@@ -230,12 +267,44 @@ mod tests {
                 emoji: "👍".into(),
                 on: true,
             },
+            Frame::InRoom {
+                room: [4u8; 32],
+                op: Box::new(Frame::Chat {
+                    id,
+                    body: "in the room".into(),
+                    reply_to: None,
+                }),
+            },
         ] {
             let bytes = encode(&frame).unwrap();
             let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
             assert_eq!(len, bytes.len() - 4);
             assert_eq!(decode(&bytes[4..]).unwrap(), frame);
         }
+    }
+
+    #[test]
+    fn a_room_op_keeps_its_id_and_names_its_conversation() {
+        let id = Counter::new([9u8; 32], 0).mint();
+        let wrapped = Frame::InRoom {
+            room: [4u8; 32],
+            op: Box::new(Frame::Chat {
+                id,
+                body: "hi".into(),
+                reply_to: None,
+            }),
+        };
+        assert_eq!(wrapped.id(), Some(id));
+        // A room op files under the room, a 1:1 op under the peer that sent it.
+        assert_eq!(wrapped.conversation([7u8; 32]), [4u8; 32]);
+        assert!(matches!(wrapped.unwrap_room(), Frame::Chat { .. }));
+
+        let direct = Frame::Chat {
+            id,
+            body: "hi".into(),
+            reply_to: None,
+        };
+        assert_eq!(direct.conversation([7u8; 32]), [7u8; 32]);
     }
 
     #[tokio::test]
