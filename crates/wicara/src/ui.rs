@@ -131,6 +131,8 @@ pub enum UiCommand {
         on: bool,
     },
     Nick(String),
+    /// Dial a peer without restarting.
+    Connect([u8; 32]),
     Room(RoomCommand),
     SendFile {
         peer: [u8; 32],
@@ -484,6 +486,12 @@ impl Ui {
             }
             "nick" => self.status = "usage: /nick <name>".into(),
             "room" => self.room_command(arg.trim()),
+            "connect" => match parse_key(arg.trim()) {
+                Some(peer) => {
+                    let _ = self.commands.send(UiCommand::Connect(peer));
+                }
+                None => self.status = "usage: /connect <endpoint-id>".into(),
+            },
             "send" if !arg.trim().is_empty() => match self.selected_key() {
                 Some(peer) => {
                     let _ = self.commands.send(UiCommand::SendFile {
@@ -566,7 +574,7 @@ impl Ui {
     fn hints(&self) -> &'static str {
         match self.focus {
             Focus::Chat => "  ↑↓ pick · r reply · e edit · d delete · 1-5 react",
-            _ => "  tab · enter · /peers /whoami /nick /room /send · ^c quit",
+            _ => "  tab · enter · /connect /peers /nick /room /send · ^c quit",
         }
     }
 
@@ -1151,6 +1159,26 @@ mod tests {
         assert_ne!(spans[1].style, spans[3].style, "your own mention stands out");
         assert_eq!(mention_spans("no mentions", "satya").len(), 1);
         assert_eq!(mention_spans("", "satya").len(), 0);
+    }
+
+    #[test]
+    fn connect_takes_an_endpoint_id_and_rejects_junk() {
+        let (mut ui, mut rx) = ui();
+        let peer = [9u8; 32];
+        for c in format!("/connect {}", data_encoding::HEXLOWER.encode(&peer)).chars() {
+            press(&mut ui, c);
+        }
+        ui.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(rx.try_recv(), Ok(UiCommand::Connect(peer)));
+
+        for line in ["/connect", "/connect nonsense", "/connect abcd"] {
+            for c in line.chars() {
+                press(&mut ui, c);
+            }
+            ui.on_key(KeyEvent::from(KeyCode::Enter));
+            assert!(ui.status.contains("usage: /connect"), "{line}");
+            assert!(rx.try_recv().is_err(), "{line} must not dial");
+        }
     }
 
     #[test]

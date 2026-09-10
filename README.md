@@ -32,8 +32,8 @@ design, not an oversight.
 
 Inside the UI: `tab` cycles the peer list, the chat and the input bar; in the
 chat pane `↑↓` picks a message and `r` replies, `e` edits, `d` deletes and `1`–`5`
-react. `/peers` `/whoami` `/nick <name>` `/send <path>` `/room create <name>`
-`/room invite <id>` `/room kick <id>` `/quit`.
+react. `/connect <id>` `/peers` `/whoami` `/nick <name>` `/send <path>`
+`/room create <name>` `/room invite <id>` `/room kick <id>` `/quit`.
 
 ## Demo
 

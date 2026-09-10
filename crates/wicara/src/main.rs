@@ -96,6 +96,8 @@ struct App {
     /// on the hub's word.
     rooms: Arc<Mutex<HashMap<RoomId, Room>>>,
     identity: ed25519_dalek::SigningKey,
+    /// Kept so `/connect` can dial without restarting the process.
+    endpoint: Endpoint,
 }
 
 impl App {
@@ -278,6 +280,7 @@ async fn run(
 
     let app = App {
         me: *ep.id().as_bytes(),
+        endpoint: ep.clone(),
         identity: identity.clone(),
         rooms: Arc::new(Mutex::new(HashMap::new())),
         store: Arc::new(Mutex::new(store)),
@@ -307,24 +310,7 @@ async fn run(
     tokio::spawn(accept_loop(ep.clone(), app.clone()));
 
     if let Some(peer) = dial {
-        // A peer you named is a contact whether or not the dial lands. Without
-        // this you could not address someone who is offline, which is the whole
-        // point of having a mailbox.
-        let key = *peer.as_bytes();
-        let nick = app.store.lock().unwrap().setting(&nick_key(&key))?;
-        let _ = app.events.send(UiEvent::Known { peer: key, nick });
-
-        let (ep, app) = (ep.clone(), app.clone());
-        tokio::spawn(async move {
-            match ep.connect(peer, ALPN).await {
-                Ok(conn) => {
-                    if let Err(err) = session(conn, app.clone(), true).await {
-                        let _ = app.events.send(UiEvent::Status(format!("session ended: {err}")));
-                    }
-                }
-                Err(err) => app.status(format!("could not reach {peer}: {err}")),
-            }
-        });
+        dial_peer(&app, *peer.as_bytes());
     }
 
     tokio::spawn(dispatch(app.clone(), command_rx));
@@ -333,6 +319,45 @@ async fn run(
     let result = ui::run(ui, event_rx).await;
     ep.close().await;
     result
+}
+
+/// Dials a peer and runs the session, adding them as a contact either way.
+///
+/// A peer you named is a contact whether or not the dial lands: without that
+/// you could not address someone who is offline, which is the whole point of
+/// having a mailbox.
+fn dial_peer(app: &App, peer: [u8; 32]) {
+    if peer == app.me {
+        app.status("that is your own endpoint id");
+        return;
+    }
+    if app.live.lock().unwrap().contains_key(&peer) {
+        app.status(format!("already connected to {}", ui::short(&peer)));
+        return;
+    }
+    match app.store.lock().unwrap().setting(&nick_key(&peer)) {
+        Ok(nick) => {
+            let _ = app.events.send(UiEvent::Known { peer, nick });
+        }
+        Err(err) => tracing::warn!(%err, "could not read a remembered nickname"),
+    }
+
+    let app = app.clone();
+    tokio::spawn(async move {
+        let Ok(id) = iroh::EndpointId::from_bytes(&peer) else {
+            app.status("that is not a valid endpoint id");
+            return;
+        };
+        app.status(format!("dialing {}", ui::short(&peer)));
+        match app.endpoint.connect(id, ALPN).await {
+            Ok(conn) => {
+                if let Err(err) = session(conn, app.clone(), true).await {
+                    app.status(format!("session ended: {err}"));
+                }
+            }
+            Err(err) => app.status(format!("could not reach {}: {err}", ui::short(&peer))),
+        }
+    });
 }
 
 /// A peer's last-seen nickname, so an offline contact is still a name rather
@@ -377,6 +402,10 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                     // that can never arrive would be worse than saying so.
                     None => app.status("attachments need a live connection to that peer"),
                 }
+                continue;
+            }
+            UiCommand::Connect(peer) => {
+                dial_peer(&app, peer);
                 continue;
             }
             UiCommand::Room(cmd) => {
