@@ -59,16 +59,16 @@ it back when you want to copy something, and again to take it back. `/connect <i
 
 ## Demo
 
-[![asciicast](https://asciinema.org/a/Utalbmuc14mVTb9q.svg)](https://asciinema.org/a/Utalbmuc14mVTb9q)
+[![asciicast](https://asciinema.org/a/1265096.svg)](https://asciinema.org/a/1265096)
 
 Four machines on four networks, in one tmux window: a laptop, two lab servers —
 one of them behind a NAT — and an arm64 Jetson. Every pane shows the other three
 online over a direct hole-punched path, and the messages, the reaction and the
 reply travel between them with no server involved.
 
-A [second recording](https://asciinema.org/a/nC7eumgE3Gqalxg2) follows one
-terminal more closely: unlocking the identity, dialling a peer by pasted key,
-and a file arriving with its BLAKE3 shown on both screens.
+`demo.cast` in the repo follows one terminal more closely: unlocking the
+identity, dialling a peer by pasted key, and a file arriving with its BLAKE3
+shown on both screens.
 
 Both are text rather than video, so you can select and copy out of them, and
 both are in the repo — `asciinema play demo-four-machines.cast` works offline.
