@@ -41,6 +41,10 @@ const MAX_ENVELOPE: usize = 64 * 1024;
 /// unauthenticated mailbox is free disk for anyone who wants it; an
 /// authenticated one still needs a ceiling.
 const QUOTA_PER_SENDER: usize = 200;
+/// …and a per-sender cap alone bounds nothing, because a keypair is free: an
+/// attacker mints a new identity and gets another 200. This is the limit that
+/// actually caps the disk one recipient can cost.
+const QUOTA_PER_RECIPIENT: usize = 2_000;
 const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 
@@ -148,6 +152,12 @@ async fn post_mail(
         return Err(Error(
             StatusCode::TOO_MANY_REQUESTS,
             format!("{QUOTA_PER_SENDER} messages already waiting for that recipient"),
+        ));
+    }
+    if store.pending_for(&recipient)? >= QUOTA_PER_RECIPIENT {
+        return Err(Error(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("that mailbox is full at {QUOTA_PER_RECIPIENT} messages"),
         ));
     }
     store.put_mail(&envelope.sender, &recipient, &body)?;

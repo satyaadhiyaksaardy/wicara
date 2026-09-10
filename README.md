@@ -128,7 +128,10 @@ offline member finds the room when they return. Room messages are encrypted
 pairwise to each member, which is fine to roughly twenty of them.
 
 **Attachments** go over their own QUIC stream in 64 KiB chunks with a BLAKE3
-hash checked on arrival. A file that does not match is deleted, not kept.
+hash checked on arrival. A file that does not match is deleted, not kept, and
+the announced size is refused above 256 MiB before a byte is written — the hash
+can only be checked once the stream ends, so a limit that ran afterwards would
+be a limit on nothing.
 
 **At rest**, the identity file and every message body are encrypted with
 XChaCha20-Poly1305 under a key derived from your passphrase with Argon2id. Not
@@ -189,6 +192,7 @@ Being exact about this is the point of the project, so here is the whole of it.
 | **The social graph, at the relay** | the relay operator learns which EndpointIds talk and when, though not what they say. |
 | **Post-compromise security** | none. A stolen identity key exposes future messages until it is rotated. Forward secrecy protects past mailbox messages only. |
 | **Availability of offline delivery** | the hub is a single point of failure for it, and for room discovery. Live 1:1 chat keeps working without it. |
+| **Mailbox flooding** | a keypair is free, so a determined attacker can mint identities and fill a mailbox up to its per-recipient cap. The caps bound the damage; they do not prevent the attempt. |
 | **Multiple devices** | one identity is one device. No sync. |
 
 Run without `--hub` and the last three rows stop applying, because then there is

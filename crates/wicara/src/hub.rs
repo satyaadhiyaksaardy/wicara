@@ -13,6 +13,30 @@ use wicara_core::{
 };
 use x25519_dalek::StaticSecret;
 
+/// Ceilings on what the hub is allowed to hand back. It is not trusted, so its
+/// responses are read with a limit rather than buffered whole — otherwise a
+/// hostile or compromised hub can exhaust this process's memory with one reply.
+const MAX_PREKEY_REPLY: usize = 4 * 1024;
+const MAX_ROOM_REPLY: usize = 4 * 1024 * 1024;
+const MAX_MAIL_REPLY: usize = 32 * 1024 * 1024;
+
+/// Reads a response body, refusing to grow past `cap`.
+async fn limited(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+    ensure!(
+        res.content_length().is_none_or(|n| n <= cap as u64),
+        "hub announced a reply over the {cap}-byte limit"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        ensure!(
+            body.len() + chunk.len() <= cap,
+            "hub reply ran past the {cap}-byte limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 pub struct Hub {
     base: String,
     http: reqwest::Client,
@@ -64,7 +88,7 @@ impl Hub {
             bail!("that endpoint has not published a prekey");
         }
         ensure!(res.status().is_success(), "hub returned {}", res.status());
-        let signed: SignedPrekey = postcard::from_bytes(&res.bytes().await?)?;
+        let signed: SignedPrekey = postcard::from_bytes(&limited(res, MAX_PREKEY_REPLY).await?)?;
         signed.verify(owner)
     }
 
@@ -99,7 +123,7 @@ impl Hub {
             .await
             .context("draining the mailbox")?;
         ensure!(res.status().is_success(), "hub returned {}", res.status());
-        Ok(postcard::from_bytes(&res.bytes().await?)?)
+        Ok(postcard::from_bytes(&limited(res, MAX_MAIL_REPLY).await?)?)
     }
 
     /// Only after the messages are safely in the local store: the hub is the
@@ -151,7 +175,7 @@ impl Hub {
             bail!("the hub has no log for that room");
         }
         ensure!(res.status().is_success(), "hub returned {}", res.status());
-        let entries: Vec<RoomEntry> = postcard::from_bytes(&res.bytes().await?)?;
+        let entries: Vec<RoomEntry> = postcard::from_bytes(&limited(res, MAX_ROOM_REPLY).await?)?;
         let room = verify_log(&entries)?;
         ensure!(&room.id == id, "the hub returned a log for a different room");
         Ok((room, entries))

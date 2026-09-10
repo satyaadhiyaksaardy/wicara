@@ -19,15 +19,25 @@ use crate::{App, ui::UiEvent};
 
 /// Bigger than a QUIC packet, small enough that the progress bar moves.
 const CHUNK: usize = 64 * 1024;
-/// Refuse a peer that keeps sending after the size it announced. Without this a
-/// peer could fill the disk with one "1 KiB" file.
-const SLACK: u64 = 0;
+/// A ceiling on what one attachment may be.
+///
+/// The size in the header is chosen by the sender and the BLAKE3 check only
+/// runs once the stream has ended, so without a limit here a peer that
+/// announces an enormous size can write until the disk is full before anything
+/// rejects it.
+const MAX_FILE: u64 = 256 * 1024 * 1024;
 
 pub async fn send(app: App, conn: Connection, peer: [u8; 32], path: PathBuf) -> Result<()> {
     let meta = tokio::fs::metadata(&path)
         .await
         .with_context(|| format!("cannot read {}", path.display()))?;
     ensure!(meta.is_file(), "{} is not a file", path.display());
+    ensure!(
+        meta.len() <= MAX_FILE,
+        "{} is {} bytes, over the {MAX_FILE}-byte limit",
+        path.display(),
+        meta.len()
+    );
     let name = path
         .file_name()
         .context("that path has no file name")?
@@ -111,6 +121,11 @@ async fn receive(app: &App, peer: [u8; 32], mut recv: iroh::endpoint::RecvStream
         id.sender == peer,
         "attachment is minted under a key other than the sender's"
     );
+    // Checked before a byte is written, not after.
+    ensure!(
+        size <= MAX_FILE,
+        "peer announced a {size}-byte attachment, over the {MAX_FILE}-byte limit"
+    );
 
     app.store.lock().unwrap().record(&peer, &header)?;
     app.send_log(peer)?;
@@ -129,7 +144,7 @@ async fn receive(app: &App, peer: [u8; 32], mut recv: iroh::endpoint::RecvStream
             break;
         }
         got += n as u64;
-        if got > size + SLACK {
+        if got > size {
             let _ = tokio::fs::remove_file(&path).await;
             bail!("peer sent more than the {size} bytes it announced");
         }

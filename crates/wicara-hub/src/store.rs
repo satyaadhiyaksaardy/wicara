@@ -82,6 +82,18 @@ impl HubStore {
         Ok(n as usize)
     }
 
+    /// Everything waiting for one recipient, from everyone. The per-sender
+    /// quota does not bound this: a keypair costs nothing, so an attacker just
+    /// makes more senders.
+    pub fn pending_for(&self, recipient: &[u8; 32]) -> Result<usize> {
+        let n: i64 = self.0.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM mail WHERE recipient = ?1",
+            params![&recipient[..]],
+            |row| row.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     pub fn mail_for(&self, recipient: &[u8; 32]) -> Result<Vec<(i64, Envelope)>> {
         let conn = self.0.lock().unwrap();
         let mut stmt =
@@ -191,9 +203,13 @@ mod tests {
         }
         store.put_mail(&other.sender, &bob, &other_blob).unwrap();
 
-        // The quota counts one sender's backlog, not the mailbox's total.
+        // The quota counts one sender's backlog, not the mailbox's total —
+        // which is exactly why a per-sender cap alone bounds nothing: a keypair
+        // is free, so an attacker just becomes a new sender.
         assert_eq!(store.pending_from(&alice, &bob).unwrap(), 3);
         assert_eq!(store.pending_from(&other.sender, &bob).unwrap(), 1);
+        assert_eq!(store.pending_for(&bob).unwrap(), 4, "the whole mailbox");
+        assert_eq!(store.pending_for(&alice).unwrap(), 0);
         assert_eq!(store.mail_for(&bob).unwrap().len(), 4);
         assert!(store.mail_for(&alice).unwrap().is_empty());
 
