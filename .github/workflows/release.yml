@@ -20,6 +20,9 @@ jobs:
           # that would not start on 22.04 LTS.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+          # Jetsons, Raspberry Pis, ARM servers.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           # Intel macOS is cross-built from the Apple Silicon runner: the last
