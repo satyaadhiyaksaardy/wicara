@@ -2,3 +2,10 @@
 *.db
 *.db-wal
 *.db-shm
+
+# Local tooling and notes, not part of the project
+/.beads/
+/.claude/
+AGENTS.md
+CLAUDE.md
+wicara.md
