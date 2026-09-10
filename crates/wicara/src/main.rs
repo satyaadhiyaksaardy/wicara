@@ -1,10 +1,12 @@
 //! wicara — a terminal messenger where a contact is a public key, not a phone number.
 
+mod hub;
 mod identity;
 mod store;
 mod ui;
 
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -17,9 +19,14 @@ use iroh::{
     endpoint::{Connection, presets},
 };
 use tokio::sync::{broadcast, mpsc};
-use wicara_core::wire::{Frame, read_frame, write_frame};
+use wicara_core::{
+    e2e::{Envelope, VerifiedPrekey},
+    wire::{Frame, read_frame, write_frame},
+};
+use x25519_dalek::StaticSecret;
 
 use crate::{
+    hub::Hub,
     store::Store,
     ui::{Ui, UiCommand, UiEvent},
 };
@@ -27,6 +34,9 @@ use crate::{
 /// Bump this whenever the wire format changes incompatibly.
 const ALPN: &[u8] = b"wicara/0";
 const HISTORY_ON_START: usize = 200;
+/// The hub is polled rather than held open, which is also why there is no
+/// keepalive to write: Cloudflare's 100s idle cutoff has nothing to cut.
+const DRAIN_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(version, about = "P2P encrypted chat. You are your public key.")]
@@ -53,12 +63,17 @@ enum Cmd {
         /// Display name shown to peers. Local metadata, never your identity.
         #[arg(long)]
         nick: Option<String>,
+        /// Hub base URL, for offline delivery. Leave it out and wicara is
+        /// exactly what M0-M2 shipped: no servers, at all.
+        #[arg(long, value_name = "URL", env = "WICARA_HUB")]
+        hub: Option<String>,
     },
 }
 
 /// Shared across the accept loop, the dialer, and every live session.
 #[derive(Clone)]
 struct App {
+    me: [u8; 32],
     store: Arc<Mutex<Store>>,
     /// Local metadata, changeable at runtime with `/nick`.
     nickname: Arc<Mutex<String>>,
@@ -66,11 +81,42 @@ struct App {
     /// Fanned out to every session; `None` means every peer, which is what a
     /// nickname change is.
     outbound: broadcast::Sender<(Option<[u8; 32]>, Frame)>,
+    /// Absent means no offline delivery, and no server anywhere.
+    hub: Option<Arc<Hub>>,
+    /// The long-lived X25519 key others seal offline messages to.
+    prekey: Arc<StaticSecret>,
+    /// Peers with a live connection right now. What decides whether an op goes
+    /// down the wire or into the mailbox.
+    live: Arc<Mutex<HashSet<[u8; 32]>>>,
+    prekeys: Arc<Mutex<HashMap<[u8; 32], VerifiedPrekey>>>,
 }
 
 impl App {
     fn nickname(&self) -> String {
         self.nickname.lock().unwrap().clone()
+    }
+
+    fn status(&self, msg: impl Into<String>) {
+        let _ = self.events.send(UiEvent::Status(msg.into()));
+    }
+
+    /// Decrypts one mailbox envelope into the store. Returns the peer whose
+    /// conversation it belongs to, and whether it was new — a message can
+    /// legitimately arrive by both the live path and the mailbox, and the op
+    /// log's primary key is what makes the second one a no-op.
+    fn absorb(&self, envelope: &Envelope) -> Result<([u8; 32], bool)> {
+        let (plaintext, sender) = wicara_core::e2e::open(envelope, &self.prekey, &self.me)?;
+        let frame: Frame = postcard::from_bytes(&plaintext)?;
+        let Some(id) = frame.id() else {
+            bail!("a hello frame has no business in a mailbox");
+        };
+        // The envelope signature proved who sealed it; this ties the op's id to
+        // the same key, exactly as the live path does.
+        if id.sender != sender {
+            bail!("mailed op is minted under a key other than the one that signed it");
+        }
+        let fresh = self.store.lock().unwrap().record(&sender, &frame)?;
+        Ok((sender, fresh))
     }
 
     /// Refolds the conversation and hands the UI the whole thing. One fold, in
@@ -111,11 +157,12 @@ async fn main() -> Result<()> {
             connect,
             relay_only,
             nick,
+            hub,
         } => {
             init_logging(&home)?;
             let me = *secret.public().as_bytes();
             let store = Store::open(&home.join("messages.db"), vault, me)?;
-            run(secret, store, connect, relay_only, nick).await
+            run(secret, store, connect, relay_only, nick, hub).await
         }
     }
 }
@@ -143,12 +190,14 @@ async fn run(
     connect: Option<String>,
     relay_only: bool,
     nick: Option<String>,
+    hub_url: Option<String>,
 ) -> Result<()> {
     let dial = connect
         .map(|s| s.trim().parse::<EndpointId>())
         .transpose()
         .context("that is not a valid EndpointId")?;
 
+    let secret_bytes = secret.to_bytes();
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()]);
@@ -168,23 +217,47 @@ async fn run(
             .setting("nickname")?
             .unwrap_or_else(|| ep.id().fmt_short().to_string()),
     };
+    let prekey = load_or_create_prekey(&store)?;
+    let identity = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
+    let hub = hub_url
+        .as_deref()
+        .map(|url| Hub::new(url, identity).map(Arc::new))
+        .transpose()?;
+
     let app = App {
+        me: *ep.id().as_bytes(),
         store: Arc::new(Mutex::new(store)),
         nickname: Arc::new(Mutex::new(nickname)),
         events,
         outbound: broadcast::channel(256).0,
+        hub,
+        prekey: Arc::new(prekey),
+        live: Arc::new(Mutex::new(HashSet::new())),
+        prekeys: Arc::new(Mutex::new(HashMap::new())),
     };
 
     replay_history(&app)?;
-    let _ = app.events.send(UiEvent::Status(if relay_only {
-        "relay-only: direct paths disabled".into()
+    app.status(if relay_only {
+        "relay-only: direct paths disabled"
+    } else if app.hub.is_some() {
+        "listening, offline delivery on"
     } else {
-        "listening".into()
-    }));
+        "listening, no hub — live chat only"
+    });
+    if app.hub.is_some() {
+        tokio::spawn(mailbox_loop(app.clone()));
+    }
 
     tokio::spawn(accept_loop(ep.clone(), app.clone()));
 
     if let Some(peer) = dial {
+        // A peer you named is a contact whether or not the dial lands. Without
+        // this you could not address someone who is offline, which is the whole
+        // point of having a mailbox.
+        let key = *peer.as_bytes();
+        let nick = app.store.lock().unwrap().setting(&nick_key(&key))?;
+        let _ = app.events.send(UiEvent::Known { peer: key, nick });
+
         let (ep, app) = (ep.clone(), app.clone());
         tokio::spawn(async move {
             match ep.connect(peer, ALPN).await {
@@ -193,11 +266,7 @@ async fn run(
                         let _ = app.events.send(UiEvent::Status(format!("session ended: {err}")));
                     }
                 }
-                Err(err) => {
-                    let _ = app
-                        .events
-                        .send(UiEvent::Status(format!("could not reach {peer}: {err}")));
-                }
+                Err(err) => app.status(format!("could not reach {peer}: {err}")),
             }
         });
     }
@@ -281,13 +350,17 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
         };
 
         let recorded = app.store.lock().unwrap().record(&peer, &frame);
-        match recorded.and_then(|_| app.send_log(peer)) {
-            Ok(()) => {
-                let _ = app.outbound.send((Some(peer), frame));
-            }
-            Err(err) => {
-                let _ = app.events.send(UiEvent::Status(format!("could not save: {err}")));
-            }
+        if let Err(err) = recorded.and_then(|_| app.send_log(peer)) {
+            app.status(format!("could not save: {err}"));
+            continue;
+        }
+
+        if app.live.lock().unwrap().contains(&peer) {
+            let _ = app.outbound.send((Some(peer), frame));
+        } else if app.hub.is_some() {
+            tokio::spawn(mail_to(app.clone(), peer, frame));
+        } else {
+            app.status("peer is offline and no hub is configured — saved locally only");
         }
     }
 }
@@ -331,6 +404,7 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
     };
 
     remember_nick(&app, &peer, &them);
+    app.live.lock().unwrap().insert(peer);
     let _ = app.events.send(UiEvent::Connected {
         peer,
         nick: them,
@@ -377,6 +451,7 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
         }
     };
 
+    app.live.lock().unwrap().remove(&peer);
     let _ = app.events.send(UiEvent::Disconnected { peer });
     result
 }
@@ -384,6 +459,97 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
 fn remember_nick(app: &App, peer: &[u8; 32], nick: &str) {
     if let Err(err) = app.store.lock().unwrap().set_setting(&nick_key(peer), nick) {
         tracing::warn!(%err, "could not remember peer nickname");
+    }
+}
+
+/// The X25519 key others seal offline messages to. Long-lived and kept in the
+/// encrypted store, so a restart does not orphan mail already sealed to it.
+///
+// ponytail: one prekey, never rotated. Rotation needs a table of retired
+// secrets so old mail still opens; add it if forward secrecy needs to bite
+// harder than "the sender kept nothing".
+fn load_or_create_prekey(store: &Store) -> Result<StaticSecret> {
+    if let Some(hex) = store.setting("prekey")? {
+        let bytes: [u8; 32] = data_encoding::HEXLOWER
+            .decode(hex.as_bytes())
+            .context("stored prekey is not hex")?
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("stored prekey is not 32 bytes"))?;
+        return Ok(StaticSecret::from(bytes));
+    }
+    let secret = StaticSecret::random();
+    store.set_setting("prekey", &data_encoding::HEXLOWER.encode(&secret.to_bytes()))?;
+    Ok(secret)
+}
+
+/// Seals one op to a peer who is not connected and leaves it on the hub.
+async fn mail_to(app: App, peer: [u8; 32], frame: Frame) {
+    let Some(hub) = app.hub.clone() else { return };
+    let cached = app.prekeys.lock().unwrap().get(&peer).copied();
+
+    let sent = async {
+        let prekey = match cached {
+            Some(prekey) => prekey,
+            None => {
+                // Verified against `peer` inside `prekey_for` — the whole point.
+                let fetched = hub.prekey_for(&peer).await?;
+                app.prekeys.lock().unwrap().insert(peer, fetched);
+                fetched
+            }
+        };
+        hub.mail(&prekey, &peer, &postcard::to_stdvec(&frame)?).await
+    }
+    .await;
+
+    match sent {
+        Ok(()) => app.status(format!("{} is offline — left it on the hub", ui::short(&peer))),
+        Err(err) => app.status(format!("could not mail to {}: {err}", ui::short(&peer))),
+    }
+}
+
+/// Publishes this endpoint's prekey, then drains the mailbox on a timer.
+async fn mailbox_loop(app: App) {
+    let Some(hub) = app.hub.clone() else { return };
+    if let Err(err) = hub.publish_prekey(&app.prekey).await {
+        app.status(format!("could not publish prekey: {err}"));
+    }
+    loop {
+        match hub.fetch_mail().await {
+            Ok(mail) if !mail.is_empty() => {
+                let mut collected = Vec::new();
+                let mut touched = HashSet::new();
+                let mut arrived = 0;
+                for (row, envelope) in mail {
+                    match app.absorb(&envelope) {
+                        Ok((peer, fresh)) => {
+                            collected.push(row);
+                            touched.insert(peer);
+                            arrived += usize::from(fresh);
+                        }
+                        // Leave it on the hub rather than lose it; the TTL
+                        // sweep is the backstop.
+                        Err(err) => tracing::warn!(%err, "could not open a mailbox envelope"),
+                    }
+                }
+                for peer in touched {
+                    if let Err(err) = app.send_log(peer) {
+                        tracing::warn!(%err, "could not refold after mailbox delivery");
+                    }
+                }
+                // Only after everything is in the local store: until then the
+                // hub holds the only copy.
+                if let Err(err) = hub.delete_mail(&collected).await {
+                    app.status(format!("could not clear the mailbox: {err}"));
+                }
+                if arrived > 0 {
+                    app.status(format!("{arrived} message(s) delivered from the hub"));
+                }
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(%err, "mailbox drain failed"),
+        }
+        tokio::time::sleep(DRAIN_EVERY).await;
     }
 }
 

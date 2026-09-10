@@ -1,24 +1,22 @@
 [package]
-name = "wicara"
+name = "wicara-hub"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 data-encoding.workspace = true
-directories.workspace = true
-ed25519-dalek.workspace = true
-iroh.workspace = true
 postcard.workspace = true
-ratatui.workspace = true
-reqwest.workspace = true
-rpassword.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-unicode-width.workspace = true
 tracing-subscriber.workspace = true
 wicara-core.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
 x25519-dalek.workspace = true

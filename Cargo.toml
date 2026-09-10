@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wicara-core", "crates/wicara"]
+members = ["crates/wicara-core", "crates/wicara", "crates/wicara-hub"]
 resolver = "3"
 
 [workspace.package]
@@ -10,6 +10,7 @@ repository = "https://github.com/satya/wicara"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+axum = "0.8.9"
 argon2 = "0.6.0"
 blake3 = "1.8.7"
 chacha20poly1305 = "0.11.0"
@@ -21,12 +22,14 @@ iroh = "1.2.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 getrandom = "0.3.4"
 ratatui = "0.30.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rpassword = "7.5.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "sync", "time"] }
 tracing = "0.1"
 unicode-width = "0.2.0"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 zeroize = "1.9.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wicara-core = { path = "crates/wicara-core" }
