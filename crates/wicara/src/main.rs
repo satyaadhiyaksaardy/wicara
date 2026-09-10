@@ -39,6 +39,9 @@ const HISTORY_ON_START: usize = 200;
 /// The hub is polled rather than held open, which is also why there is no
 /// keepalive to write: Cloudflare's 100s idle cutoff has nothing to cut.
 const DRAIN_EVERY: Duration = Duration::from_secs(30);
+/// iroh drops an idle path after 15s direct, 30s relayed, so a peer that
+/// restarted is worth retrying at about that rhythm.
+const RECONNECT_EVERY: Duration = Duration::from_secs(20);
 
 #[derive(Parser)]
 #[command(version, about = "P2P encrypted chat. You are your public key.")]
@@ -92,6 +95,8 @@ struct App {
     /// wire or into the mailbox, and where an attachment finds its stream.
     live: Arc<Mutex<HashMap<[u8; 32], Connection>>>,
     prekeys: Arc<Mutex<HashMap<[u8; 32], VerifiedPrekey>>>,
+    /// Dials in flight, so the reconnect loop does not stack them up.
+    dialing: Arc<Mutex<HashSet<[u8; 32]>>>,
     /// Rooms as their verified chains say they stand. Nothing here was taken
     /// on the hub's word.
     rooms: Arc<Mutex<HashMap<RoomId, Room>>>,
@@ -291,6 +296,7 @@ async fn run(
         prekey: Arc::new(prekey),
         home: Arc::new(home.clone()),
         live: Arc::new(Mutex::new(HashMap::new())),
+        dialing: Arc::new(Mutex::new(HashSet::new())),
         prekeys: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -310,8 +316,9 @@ async fn run(
     tokio::spawn(accept_loop(ep.clone(), app.clone()));
 
     if let Some(peer) = dial {
-        dial_peer(&app, *peer.as_bytes());
+        dial_peer(&app, *peer.as_bytes(), true);
     }
+    tokio::spawn(reconnect_loop(app.clone()));
 
     tokio::spawn(dispatch(app.clone(), command_rx));
 
@@ -326,13 +333,21 @@ async fn run(
 /// A peer you named is a contact whether or not the dial lands: without that
 /// you could not address someone who is offline, which is the whole point of
 /// having a mailbox.
-fn dial_peer(app: &App, peer: [u8; 32]) {
+fn dial_peer(app: &App, peer: [u8; 32], announce: bool) {
     if peer == app.me {
-        app.status("that is your own endpoint id");
+        if announce {
+            app.status("that is your own endpoint id");
+        }
         return;
     }
     if app.live.lock().unwrap().contains_key(&peer) {
-        app.status(format!("already connected to {}", ui::short(&peer)));
+        if announce {
+            app.status(format!("already connected to {}", ui::short(&peer)));
+        }
+        return;
+    }
+    // The reconnect loop fires faster than a dial to an unreachable peer fails.
+    if !app.dialing.lock().unwrap().insert(peer) {
         return;
     }
     match app.store.lock().unwrap().setting(&nick_key(&peer)) {
@@ -345,19 +360,51 @@ fn dial_peer(app: &App, peer: [u8; 32]) {
     let app = app.clone();
     tokio::spawn(async move {
         let Ok(id) = iroh::EndpointId::from_bytes(&peer) else {
-            app.status("that is not a valid endpoint id");
+            app.dialing.lock().unwrap().remove(&peer);
+            if announce {
+                app.status("that is not a valid endpoint id");
+            }
             return;
         };
-        app.status(format!("dialing {}", ui::short(&peer)));
-        match app.endpoint.connect(id, ALPN).await {
+        if announce {
+            app.status(format!("dialing {}", ui::short(&peer)));
+        }
+        let outcome = app.endpoint.connect(id, ALPN).await;
+        app.dialing.lock().unwrap().remove(&peer);
+        match outcome {
             Ok(conn) => {
                 if let Err(err) = session(conn, app.clone(), true).await {
-                    app.status(format!("session ended: {err}"));
+                    // A dropped session is normal; the loop will try again.
+                    tracing::info!(%err, "session ended");
                 }
             }
-            Err(err) => app.status(format!("could not reach {}: {err}", ui::short(&peer))),
+            // Silent when automatic: an offline contact would otherwise repaint
+            // the status bar every 20 seconds forever.
+            Err(err) if announce => {
+                app.status(format!("could not reach {}: {err}", ui::short(&peer)))
+            }
+            Err(err) => tracing::debug!(%err, peer = %ui::short(&peer), "redial failed"),
         }
     });
+}
+
+/// Peers do not reconnect by themselves. After a restart or a dropped network
+/// both sides sit idle, each waiting for the other to dial, and the only way
+/// back was to type `/connect` again. This redials anything known and not
+/// currently connected, so coming back online is enough.
+async fn reconnect_loop(app: App) {
+    loop {
+        let known = app.store.lock().unwrap().peers().unwrap_or_default();
+        let rooms = app.rooms.lock().unwrap().keys().copied().collect::<HashSet<_>>();
+        for peer in known {
+            // `peers()` keys conversations, and a room is keyed like an
+            // endpoint; dialling a room id would just waste a lookup.
+            if !rooms.contains(&peer) {
+                dial_peer(&app, peer, false);
+            }
+        }
+        tokio::time::sleep(RECONNECT_EVERY).await;
+    }
 }
 
 /// A peer's last-seen nickname, so an offline contact is still a name rather
@@ -405,7 +452,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                 continue;
             }
             UiCommand::Connect(peer) => {
-                dial_peer(&app, peer);
+                dial_peer(&app, peer, true);
                 continue;
             }
             UiCommand::Room(cmd) => {

@@ -77,6 +77,10 @@ Three crates in one workspace:
 | `wicara` | the client: iroh endpoint, encrypted sqlite store, ratatui UI |
 | `wicara-hub` | the server: prekey directory, mailbox, room registry |
 
+Peers you have talked to before are redialled automatically every 20 seconds
+while they are not connected, so coming back online is enough — you do not have
+to re-add anyone.
+
 **Your identity is an Ed25519 keypair, and it is also your iroh EndpointId.**
 There is no discovery server for 1:1 chat: iroh dials keys, not IP addresses,
 and resolves the address itself. iroh reports about 95% of connections ending up direct; the
