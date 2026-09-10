@@ -4927,7 +4927,7 @@ dependencies = [
 
 [[package]]
 name = "wicara"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4951,7 +4951,7 @@ dependencies = [
 
 [[package]]
 name = "wicara-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4968,7 +4968,7 @@ dependencies = [
 
 [[package]]
 name = "wicara-hub"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
