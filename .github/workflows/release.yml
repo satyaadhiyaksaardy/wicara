@@ -15,8 +15,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Static musl, so one Linux binary runs everywhere. A glibc build
+          # picks up the runner's glibc as a floor — 24.04 produced binaries
+          # that would not start on 22.04 LTS.
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           # Intel macOS is cross-built from the Apple Silicon runner: the last
@@ -33,6 +36,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - if: ${{ contains(matrix.target, 'musl') }}
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
