@@ -57,6 +57,16 @@ pub struct RoomView {
     pub joined: bool,
 }
 
+/// The live path to one peer, as iroh reports it.
+#[derive(Debug, Clone)]
+pub struct Link {
+    /// False means the NAT hole punch worked and packets go straight there.
+    pub relayed: bool,
+    /// The address, or the relay host when it is going the long way round.
+    pub via: String,
+    pub rtt_ms: u64,
+}
+
 /// How an outgoing op actually left this machine. The whole point of the design
 /// is that there are two paths; without this they look identical on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,11 +116,11 @@ pub enum UiEvent {
     Connected {
         peer: [u8; 32],
         nick: String,
-        path: String,
     },
     Path {
         peer: [u8; 32],
-        path: String,
+        /// `None` while a path is still being negotiated.
+        link: Option<Link>,
     },
     Disconnected {
         peer: [u8; 32],
@@ -228,7 +238,9 @@ struct Peer {
     /// The name you gave them with `/name`. Yours, so it is the trustworthy one.
     alias: Option<String>,
     online: bool,
-    path: String,
+    link: Option<Link>,
+    /// Recent round-trip samples, for the sparkline on the network map.
+    rtt: Vec<u64>,
     log: Vec<Entry>,
     unread: usize,
     /// Index into `log` of the message the chat cursor is on.
@@ -265,8 +277,11 @@ impl Peer {
         match &self.room {
             Some(room) if !room.joined => "you are not in this room".into(),
             Some(room) => format!("{} member(s)", room.members),
-            None if self.path.is_empty() => "offline".into(),
-            None => self.path.clone(),
+            None => match &self.link {
+                None => "offline".into(),
+                Some(l) if l.relayed => format!("relayed — {} ({}ms rtt)", l.via, l.rtt_ms),
+                Some(l) => format!("direct — {} ({}ms rtt)", l.via, l.rtt_ms),
+            },
         }
     }
 }
@@ -294,6 +309,7 @@ pub struct Ui {
     /// `/help` and `/members` take over the chat pane until the next keypress.
     help: bool,
     members: bool,
+    net: bool,
     /// Whether the terminal is handing us mouse events. While it is, dragging
     /// selects nothing, so `/mouse` turns it off when you want to copy text.
     mouse: bool,
@@ -346,6 +362,7 @@ impl Ui {
             commands,
             help: false,
             members: false,
+            net: false,
             mouse: true,
             peers_area: Rect::ZERO,
             chat_area: Rect::ZERO,
@@ -362,7 +379,8 @@ impl Ui {
                 nick: None,
                 alias: None,
                 online: false,
-                path: String::new(),
+                link: None,
+                rtt: Vec::new(),
                 log: Vec::new(),
                 unread: 0,
                 unread_from: None,
@@ -382,17 +400,26 @@ impl Ui {
                 p.nick = nick;
                 p.alias = alias;
             }
-            UiEvent::Connected { peer, nick, path } => {
+            UiEvent::Connected { peer, nick } => {
                 let p = self.peer_mut(peer);
                 p.nick = Some(nick);
                 p.online = true;
-                p.path = path;
             }
-            UiEvent::Path { peer, path } => self.peer_mut(peer).path = path,
+            UiEvent::Path { peer, link } => {
+                let p = self.peer_mut(peer);
+                if let Some(link) = &link {
+                    p.rtt.push(link.rtt_ms);
+                    // ponytail: sixteen samples is all the sparkline shows.
+                    if p.rtt.len() > 16 {
+                        p.rtt.remove(0);
+                    }
+                }
+                p.link = link;
+            }
             UiEvent::Disconnected { peer } => {
                 let p = self.peer_mut(peer);
                 p.online = false;
-                p.path.clear();
+                p.link = None;
             }
             UiEvent::Log { peer, entries } => {
                 let selected = self.selected_key() == Some(peer);
@@ -480,9 +507,10 @@ impl Ui {
             let _ = self.commands.send(UiCommand::Quit);
             return false;
         }
-        if self.help || self.members {
+        if self.help || self.members || self.net {
             self.help = false;
             self.members = false;
+            self.net = false;
             // The key that dismissed it should not also do something else.
             if !matches!(key.code, KeyCode::Char(_)) {
                 return true;
@@ -718,6 +746,7 @@ impl Ui {
             "name" => self.name_command(arg.trim()),
             "whois" => self.whois(),
             "help" => self.help = true,
+            "net" => self.net = true,
             "members" => match self.peers.get(self.sel) {
                 Some(p) if p.room.is_some() => self.members = true,
                 Some(_) => self.status = "/members is for rooms".into(),
@@ -930,6 +959,7 @@ impl Ui {
             .iter()
             .map(|p| {
                 let dot = if p.online { "●" } else { "○" };
+                // The dot says reachable; the name carries the key's colour.
                 let colour = if p.online { Color::Green } else { Color::DarkGray };
                 let (dot, colour) = match &p.room {
                     Some(room) if room.joined => ("#", Color::Blue),
@@ -938,7 +968,10 @@ impl Ui {
                 };
                 let mut spans = vec![Span::styled(format!("{dot} "), Style::new().fg(colour))];
                 if p.named() {
-                    spans.push(Span::raw(p.label()));
+                    spans.push(Span::styled(
+                        p.label(),
+                        Style::new().fg(key_colour(&p.key)),
+                    ));
                 } else {
                     // Their claim, not your decision. Shown so it cannot be
                     // mistaken for a name you verified.
@@ -982,6 +1015,9 @@ impl Ui {
         }
         if self.members {
             return self.draw_members(frame, area);
+        }
+        if self.net {
+            return self.draw_net(frame, area);
         }
         let Some(peer) = self.peers.get(self.sel) else {
             frame.render_widget(
@@ -1045,7 +1081,7 @@ impl Ui {
             let (who, colour) = if entry.outbound {
                 (self.nickname.clone(), Color::Cyan)
             } else if peer.named() {
-                (peer.label(), Color::Magenta)
+                (peer.label(), key_colour(&peer.key))
             } else {
                 // Dimmed, because this is what they call themselves.
                 (peer.label(), Color::DarkGray)
@@ -1272,6 +1308,85 @@ impl Ui {
         );
     }
 
+    /// The live topology: who you reach directly, who goes the long way round
+    /// through a relay, and how long each takes.
+    ///
+    /// No other messenger draws this, because for everyone else the transport
+    /// is plumbing. Here it is the claim.
+    fn draw_net(&self, frame: &mut Frame, area: Rect) {
+        let (w, h) = (
+            (area.width.saturating_sub(2) as usize).max(20),
+            (area.height.saturating_sub(2) as usize).max(12),
+        );
+        let mut c = Canvas::new(w, h);
+        let live: Vec<&Peer> = self
+            .peers
+            .iter()
+            .filter(|p| p.room.is_none() && p.online)
+            .collect();
+
+        let mid = w / 2;
+        c.boxed(mid, 0, "you", Color::Cyan);
+        if live.is_empty() {
+            c.centred(mid, 5, "nobody connected", Color::DarkGray);
+            c.centred(mid, 7, "/connect <endpoint-id>", Color::DarkGray);
+            return frame.render_widget(
+                Paragraph::new(c.into_lines()).block(self.net_block()),
+                area,
+            );
+        }
+
+        // One column per peer, with a bus across the top joining them.
+        let slot = w / live.len();
+        let xs: Vec<usize> = (0..live.len()).map(|i| slot / 2 + i * slot).collect();
+        let (&first, &last) = (xs.first().unwrap(), xs.last().unwrap());
+        c.hline(4, first.min(mid), last.max(mid), '─', Color::DarkGray);
+        c.vline(mid, 3, 3, '│', Color::DarkGray);
+
+        for (peer, &x) in live.iter().zip(&xs) {
+            let colour = key_colour(&peer.key);
+            let relayed = peer.link.as_ref().is_some_and(|l| l.relayed);
+            // Dotted for a relayed path, solid for a hole-punched one: the
+            // difference the whole design turns on.
+            let stroke = if relayed { '┊' } else { '│' };
+            let label_colour = if relayed { Color::Yellow } else { Color::Green };
+
+            c.put(x, 4, if x == mid { '┼' } else { '┬' }, Color::DarkGray);
+            c.vline(x, 5, 5, stroke, label_colour);
+            match &peer.link {
+                Some(l) => {
+                    c.centred(x, 6, if relayed { "relayed" } else { "direct" }, label_colour);
+                    c.centred(x, 7, &format!("{}ms", l.rtt_ms), Color::DarkGray);
+                    if peer.rtt.len() > 1 {
+                        c.centred(x, 8, &sparkline(&peer.rtt), Color::DarkGray);
+                    }
+                }
+                None => c.centred(x, 6, "…", Color::DarkGray),
+            }
+            c.vline(x, 9, 9, stroke, label_colour);
+
+            let mut y = 10;
+            if let Some(l) = &peer.link.as_ref().filter(|l| l.relayed) {
+                // The relay is drawn as a hop you can see, not a footnote.
+                let host = l.via.trim_start_matches("https://");
+                let host = host.split('.').next().unwrap_or(host);
+                c.boxed(x, y, host, Color::Yellow);
+                c.vline(x, y + 3, y + 3, '┊', Color::Yellow);
+                y += 4;
+            }
+            c.boxed(x, y, &peer.label(), colour);
+        }
+        frame.render_widget(Paragraph::new(c.into_lines()).block(self.net_block()), area);
+    }
+
+    fn net_block(&self) -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(Color::Cyan))
+            .title(" network — any key to close ")
+    }
+
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
         let dim = Style::new().fg(Color::DarkGray);
         let key = Style::new().fg(Color::Cyan);
@@ -1290,6 +1405,7 @@ impl Ui {
             ("/room create <name>", "start a room; then /room invite and /room kick"),
             ("/peers  /whoami", "who is around · your own key, copied to the clipboard"),
             ("/mouse", "hand the mouse back so you can select and copy text"),
+            ("/net", "the live mesh — who is direct, who is relayed"),
             ("/members", "who the chain says is in this room"),
             ("/leave", "sign yourself out of the selected room"),
             ("/clear", "empty this conversation but keep the contact"),
@@ -1521,6 +1637,130 @@ fn mention_spans(text: &str, me: &str) -> Vec<Span<'static>> {
         spans.push(Span::raw(rest.to_string()));
     }
     spans
+}
+
+/// A small character grid to draw a diagram into.
+///
+/// Composing a 2D picture out of ratatui spans directly is painful — every line
+/// has to be assembled left to right. Painting into a grid and converting once
+/// at the end keeps the drawing code readable.
+struct Canvas {
+    w: usize,
+    h: usize,
+    cells: Vec<(char, Color)>,
+}
+
+impl Canvas {
+    fn new(w: usize, h: usize) -> Self {
+        Self {
+            w,
+            h,
+            cells: vec![(' ', Color::Reset); w * h],
+        }
+    }
+
+    fn put(&mut self, x: usize, y: usize, ch: char, colour: Color) {
+        if x < self.w && y < self.h {
+            self.cells[y * self.w + x] = (ch, colour);
+        }
+    }
+
+    fn text(&mut self, x: usize, y: usize, s: &str, colour: Color) {
+        for (i, ch) in s.chars().enumerate() {
+            self.put(x + i, y, ch, colour);
+        }
+    }
+
+    /// Centres `s` on `x`, clamped to the canvas.
+    fn centred(&mut self, x: usize, y: usize, s: &str, colour: Color) {
+        let start = x.saturating_sub(s.chars().count() / 2);
+        self.text(start, y, s, colour);
+    }
+
+    fn vline(&mut self, x: usize, y0: usize, y1: usize, ch: char, colour: Color) {
+        for y in y0..=y1 {
+            self.put(x, y, ch, colour);
+        }
+    }
+
+    fn hline(&mut self, y: usize, x0: usize, x1: usize, ch: char, colour: Color) {
+        for x in x0..=x1 {
+            self.put(x, y, ch, colour);
+        }
+    }
+
+    /// A rounded box with a label, centred on `x`. Returns its width.
+    fn boxed(&mut self, x: usize, y: usize, label: &str, colour: Color) -> usize {
+        let w = label.chars().count() + 4;
+        let left = x.saturating_sub(w / 2);
+        self.put(left, y, '╭', colour);
+        self.put(left + w - 1, y, '╮', colour);
+        self.hline(y, left + 1, left + w - 2, '─', colour);
+        self.put(left, y + 1, '│', colour);
+        self.put(left + w - 1, y + 1, '│', colour);
+        self.text(left + 2, y + 1, label, colour);
+        self.put(left, y + 2, '╰', colour);
+        self.put(left + w - 1, y + 2, '╯', colour);
+        self.hline(y + 2, left + 1, left + w - 2, '─', colour);
+        w
+    }
+
+    /// Runs of one colour become one span, so a row is a handful of spans
+    /// rather than one per character.
+    fn into_lines(self) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(self.h);
+        for row in self.cells.chunks(self.w) {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut run = String::new();
+            let mut colour = Color::Reset;
+            for (ch, c) in row {
+                if *c != colour && !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), Style::new().fg(colour)));
+                }
+                colour = *c;
+                run.push(*ch);
+            }
+            if !run.is_empty() {
+                spans.push(Span::styled(run, Style::new().fg(colour)));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines
+    }
+}
+
+/// A colour derived from the public key, so it follows the identity rather than
+/// the name. An impostor picking your contact's nickname still gets a different
+/// colour, which makes the impersonation defence something you see.
+pub fn key_colour(key: &[u8; 32]) -> Color {
+    let hue = u16::from_be_bytes([key[0], key[1]]) as f32 / 65_535.0 * 360.0;
+    let (s, l) = (0.62_f32, 0.66_f32);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (hue / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    Color::Rgb(
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
+
+/// A latency history as one line of blocks.
+fn sparkline(samples: &[u64]) -> String {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let top = samples.iter().copied().max().unwrap_or(0).max(1);
+    samples
+        .iter()
+        .map(|v| BLOCKS[((v * 7) / top).min(7) as usize])
+        .collect()
 }
 
 /// Puts text on the system clipboard with OSC 52, which the terminal forwards
@@ -1814,7 +2054,6 @@ mod tests {
         ui.apply(UiEvent::Connected {
             peer: [7; 32],
             nick: "bob".into(),
-            path: "direct".into(),
         });
         for line in ["/whoami", "/peers", "/nope"] {
             for c in line.chars() {

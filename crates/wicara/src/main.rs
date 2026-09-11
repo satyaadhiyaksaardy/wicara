@@ -763,7 +763,6 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
     let _ = app.events.send(UiEvent::Connected {
         peer,
         nick: them,
-        path: describe_path(&conn).1,
     });
     tokio::spawn(watch_path(conn.clone(), app.events.clone(), peer));
 
@@ -779,7 +778,6 @@ async fn session(conn: Connection, app: App, dialed: bool) -> Result<()> {
                     let _ = app.events.send(UiEvent::Connected {
                         peer,
                         nick: nickname,
-                        path: describe_path(&conn).1,
                     });
                 }
                 Ok(Some(frame)) => match app.accept(peer, frame).await {
@@ -1096,25 +1094,23 @@ async fn mailbox_loop(app: App) {
     }
 }
 
-/// Whether the live path is hole-punched or relayed. Returns the kind on its
-/// own too, because rtt jitters on every sample and would spam a change log.
-fn describe_path(conn: &Connection) -> (String, String) {
+/// The live path to a peer: whether it is hole-punched, where it goes, and how
+/// long the round trip takes.
+fn describe_path(conn: &Connection) -> Option<ui::Link> {
     let paths = conn.paths();
-    let Some(p) = paths.iter().find(|p| p.is_selected()) else {
-        return ("negotiating".into(), "negotiating".into());
-    };
-    let kind = if p.is_ip() { "direct" } else { "relayed" };
+    let p = paths.iter().find(|p| p.is_selected())?;
     // TransportAddr's Debug is `Ip(1.2.3.4:5)` / `Relay(https://…)`; the wrapper
-    // is noise once `kind` has already said which it is.
-    let addr = format!("{:?}", p.remote_addr());
-    let addr = addr
+    // is noise once `relayed` has already said which it is.
+    let via = format!("{:?}", p.remote_addr());
+    let via = via
         .split_once('(')
         .map(|(_, rest)| rest.trim_end_matches(')').to_string())
-        .unwrap_or(addr);
-    (
-        format!("{kind} {addr}"),
-        format!("{kind} — {addr} ({}ms rtt)", p.rtt().as_millis()),
-    )
+        .unwrap_or(via);
+    Some(ui::Link {
+        relayed: p.is_relay(),
+        via,
+        rtt_ms: p.rtt().as_millis() as u64,
+    })
 }
 
 /// A relayed connection usually upgrades to direct within a second or two, and
@@ -1123,15 +1119,13 @@ fn describe_path(conn: &Connection) -> (String, String) {
 // ponytail: 1s poll rather than paths_stream, which needs a Stream adapter
 // dependency for one line of output.
 async fn watch_path(conn: Connection, events: mpsc::UnboundedSender<UiEvent>, peer: [u8; 32]) {
-    let mut last = String::new();
     loop {
-        let (kind, line) = describe_path(&conn);
-        if kind != last {
-            if events.send(UiEvent::Path { peer, path: line }).is_err() {
-                return;
-            }
-            last = kind;
+        // Sampled rather than only reported on change: the network map draws a
+        // sparkline, and a flat line is information too.
+        let link = describe_path(&conn);
+        if events.send(UiEvent::Path { peer, link }).is_err() {
+            return;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
