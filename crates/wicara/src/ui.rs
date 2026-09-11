@@ -46,6 +46,11 @@ pub struct Entry {
 #[derive(Debug, Clone)]
 pub struct RoomView {
     pub name: String,
+    /// Everyone the verified chain puts in the room, and who founded it. Shown
+    /// by `/members`: verifying membership you cannot inspect is a strange
+    /// place to leave someone.
+    pub member_keys: Vec<[u8; 32]>,
+    pub founder: [u8; 32],
     pub members: usize,
     /// False once you have been kicked — the room stays visible with its
     /// history, but you can no longer post to it.
@@ -128,6 +133,8 @@ pub enum UiEvent {
         done: u64,
         total: u64,
     },
+    /// Something worth remembering happened in this conversation.
+    Note { peer: [u8; 32], text: String },
     /// A conversation was deleted from this machine.
     Forgotten { peer: [u8; 32] },
     /// Everything was. The UI starts over from whatever is reloaded after.
@@ -137,7 +144,10 @@ pub enum UiEvent {
         id: [u8; 32],
         view: RoomView,
     },
-    Status(String),
+    /// `bad` gets the red treatment. "listening" and "prekey is not signed by
+    /// that endpoint" rendered identically before, and only one of those means
+    /// someone is attacking you.
+    Status { text: String, bad: bool },
 }
 
 /// What `/room` asked for.
@@ -225,6 +235,9 @@ struct Peer {
     cursor: usize,
     /// Where the messages you have not seen begin.
     unread_from: Option<usize>,
+    /// Things that happened *about* this conversation — mailed, kicked, failed
+    /// — kept beside it instead of flashing past in the status bar.
+    notes: Vec<(u64, String)>,
     /// Set when this conversation is a room rather than a person. A room id is
     /// 32 bytes exactly like an endpoint id, which is why one list holds both.
     room: Option<RoomView>,
@@ -260,6 +273,7 @@ impl Peer {
 
 pub struct Ui {
     me: String,
+    me_key: [u8; 32],
     nickname: String,
     peers: Vec<Peer>,
     index: HashMap<[u8; 32], usize>,
@@ -272,12 +286,14 @@ pub struct Ui {
     /// Wrapped chat lines scrolled up from the bottom; 0 pins to the newest.
     scroll: usize,
     status: String,
+    status_bad: bool,
     /// Attachments in flight, by message id.
     transfers: HashMap<MessageId, (u64, u64)>,
     delivery: HashMap<MessageId, Delivery>,
     commands: mpsc::UnboundedSender<UiCommand>,
-    /// `/help` takes over the chat pane until the next keypress.
+    /// `/help` and `/members` take over the chat pane until the next keypress.
     help: bool,
+    members: bool,
     /// Whether the terminal is handing us mouse events. While it is, dragging
     /// selects nothing, so `/mouse` turns it off when you want to copy text.
     mouse: bool,
@@ -291,14 +307,29 @@ pub struct Ui {
     chat_rows: Vec<usize>,
 }
 
+/// First five bytes of an already-hex key.
+fn short_hex(hex: &str) -> &str {
+    &hex[..hex.len().min(10)]
+}
+
+pub fn now_ms() -> u64 {
+    wicara_core::wire::now_ms()
+}
+
 pub fn short(key: &[u8; 32]) -> String {
     key[..5].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Ui {
-    pub fn new(me: String, nickname: String, commands: mpsc::UnboundedSender<UiCommand>) -> Self {
+    pub fn new(
+        me: String,
+        me_key: [u8; 32],
+        nickname: String,
+        commands: mpsc::UnboundedSender<UiCommand>,
+    ) -> Self {
         Self {
             me,
+            me_key,
             nickname,
             peers: Vec::new(),
             index: HashMap::new(),
@@ -309,10 +340,12 @@ impl Ui {
             caret: 0,
             scroll: 0,
             status: "waiting for peers".into(),
+            status_bad: false,
             transfers: HashMap::new(),
             delivery: HashMap::new(),
             commands,
             help: false,
+            members: false,
             mouse: true,
             peers_area: Rect::ZERO,
             chat_area: Rect::ZERO,
@@ -333,6 +366,7 @@ impl Ui {
                 log: Vec::new(),
                 unread: 0,
                 unread_from: None,
+                notes: Vec::new(),
                 cursor: 0,
                 room: None,
             });
@@ -390,6 +424,14 @@ impl Ui {
                     self.transfers.insert(id, (done, total));
                 }
             }
+            UiEvent::Note { peer, text } => {
+                let p = self.peer_mut(peer);
+                p.notes.push((crate::ui::now_ms(), text));
+                // ponytail: the last 50 are plenty; they are not history.
+                if p.notes.len() > 50 {
+                    p.notes.remove(0);
+                }
+            }
             UiEvent::Forgotten { peer } => {
                 self.peers.retain(|p| p.key != peer);
                 // Indices shifted, so the lookup has to be rebuilt rather than
@@ -413,7 +455,10 @@ impl Ui {
                 self.scroll = 0;
             }
             UiEvent::Room { id, view } => self.peer_mut(id).room = Some(view),
-            UiEvent::Status(s) => self.status = s,
+            UiEvent::Status { text, bad } => {
+                self.status = text;
+                self.status_bad = bad;
+            }
         }
     }
 
@@ -435,8 +480,9 @@ impl Ui {
             let _ = self.commands.send(UiCommand::Quit);
             return false;
         }
-        if self.help {
+        if self.help || self.members {
             self.help = false;
+            self.members = false;
             // The key that dismissed it should not also do something else.
             if !matches!(key.code, KeyCode::Char(_)) {
                 return true;
@@ -672,6 +718,11 @@ impl Ui {
             "name" => self.name_command(arg.trim()),
             "whois" => self.whois(),
             "help" => self.help = true,
+            "members" => match self.peers.get(self.sel) {
+                Some(p) if p.room.is_some() => self.members = true,
+                Some(_) => self.status = "/members is for rooms".into(),
+                None => self.status = "select a room first".into(),
+            },
             "leave" => match self.peers.get(self.sel) {
                 Some(p) if p.room.is_some() => {
                     let _ = self
@@ -842,8 +893,21 @@ impl Ui {
                     format!(" {} ", self.nickname),
                     Style::new().fg(Color::Black).bg(Color::Cyan),
                 ),
-                Span::raw(format!(" {}  ", self.me)),
-                Span::styled(&self.status, Style::new().fg(Color::DarkGray)),
+                // The short key, not all 64 characters of it: the full one is a
+                // `/whoami` away, and the room it was taking is where the
+                // messages that matter get truncated.
+                Span::styled(
+                    format!(" {}  ", short_hex(&self.me)),
+                    Style::new().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    &self.status,
+                    if self.status_bad {
+                        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new().fg(Color::Gray)
+                    },
+                ),
                 Span::styled(self.hints(), Style::new().fg(Color::DarkGray)),
             ])),
             status,
@@ -858,6 +922,7 @@ impl Ui {
     }
 
     fn draw_peers(&mut self, frame: &mut Frame, area: Rect) {
+        let inner_w = (area.width.saturating_sub(2) as usize).max(8);
         // Rooms and people share this list: a room id is 32 bytes, exactly
         // like an endpoint id, so nothing needed a second list.
         let items: Vec<ListItem> = self
@@ -886,6 +951,16 @@ impl Ui {
                         Style::new().fg(Color::Yellow),
                     ));
                 }
+                // When they were last heard from, pushed to the right edge.
+                if let Some(last) = p.log.last() {
+                    let stamp = ago(last.id.ts_ms);
+                    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+                    let gap = inner_w.saturating_sub(used + stamp.width());
+                    spans.push(Span::styled(
+                        format!("{:gap$}{stamp}", ""),
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
                 ListItem::new(Line::from(spans))
             })
             .collect();
@@ -904,6 +979,9 @@ impl Ui {
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         if self.help {
             return self.draw_help(frame, area);
+        }
+        if self.members {
+            return self.draw_members(frame, area);
         }
         let Some(peer) = self.peers.get(self.sel) else {
             frame.render_widget(
@@ -928,7 +1006,24 @@ impl Ui {
         // Where the cursor's message starts and ends, so it can be scrolled to.
         let mut cursor_span = (0usize, 0usize);
         let mut last_day = None;
+        let mut notes = peer.notes.iter().peekable();
+        let emit_notes = |lines: &mut Vec<Line<'static>>,
+                              owners: &mut Vec<usize>,
+                              upto: u64,
+                              notes: &mut std::iter::Peekable<std::slice::Iter<(u64, String)>>| {
+            while notes.peek().is_some_and(|(ts, _)| *ts <= upto) {
+                let (_, text) = notes.next().expect("peeked");
+                for chunk in wrap(text, width.saturating_sub(4)) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  · {chunk}"),
+                        Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    )));
+                    owners.push(usize::MAX);
+                }
+            }
+        };
         for (i, entry) in peer.log.iter().enumerate() {
+            emit_notes(&mut lines, &mut owners, entry.id.ts_ms, &mut notes);
             if let Some(date) = day(entry.id.ts_ms)
                 && last_day != Some(date)
             {
@@ -1079,6 +1174,8 @@ impl Ui {
             }
         }
 
+        emit_notes(&mut lines, &mut owners, u64::MAX, &mut notes);
+
         let height = (area.height.saturating_sub(2)) as usize;
         let max_scroll = lines.len().saturating_sub(height);
         if self.focus == Focus::Chat && height > 0 {
@@ -1125,6 +1222,56 @@ impl Ui {
         );
     }
 
+    /// Who the chain says is in the room, under the names *you* gave them.
+    fn draw_members(&self, frame: &mut Frame, area: Rect) {
+        let Some(room) = self.peers.get(self.sel).and_then(|p| p.room.as_ref()) else {
+            return;
+        };
+        let mut lines = vec![Line::default()];
+        for key in &room.member_keys {
+            let known = self.peers.iter().find(|p| p.key == *key);
+            let (name, trusted) = match known {
+                Some(p) => (p.label(), p.named()),
+                None if key == &self.me_key => ("you".to_string(), true),
+                None => (short(key), true),
+            };
+            let mut spans = vec![Span::styled(
+                format!("  {:<24}", if key == &self.me_key { "you".into() } else { name }),
+                if trusted {
+                    Style::new()
+                } else {
+                    Style::new().fg(Color::DarkGray)
+                },
+            )];
+            if !trusted {
+                spans.push(Span::styled("? ", Style::new().fg(Color::Yellow)));
+            }
+            if key == &room.founder {
+                spans.push(Span::styled("founder  ", Style::new().fg(Color::Blue)));
+            }
+            spans.push(Span::styled(
+                key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                Style::new().fg(Color::DarkGray),
+            ));
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  every one of these is signed into the chain; nothing here is the hub's word",
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(Color::Cyan))
+                    .title(format!(" #{} — {} members — any key to close ", room.name, room.members)),
+            ),
+            area,
+        );
+    }
+
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
         let dim = Style::new().fg(Color::DarkGray);
         let key = Style::new().fg(Color::Cyan);
@@ -1143,6 +1290,7 @@ impl Ui {
             ("/room create <name>", "start a room; then /room invite and /room kick"),
             ("/peers  /whoami", "who is around · your own key, copied to the clipboard"),
             ("/mouse", "hand the mouse back so you can select and copy text"),
+            ("/members", "who the chain says is in this room"),
             ("/leave", "sign yourself out of the selected room"),
             ("/clear", "empty this conversation but keep the contact"),
             ("/forget", "delete a conversation and the contact — no undo"),
@@ -1308,6 +1456,23 @@ fn day(ts_ms: u64) -> Option<chrono::NaiveDate> {
 fn rule(label: &str, width: usize) -> String {
     let bar = "─".repeat(width.saturating_sub(label.width() + 2) / 2);
     format!("{bar} {label} {bar}")
+}
+
+/// "now", "4m", "3h", "Tue", "12 Sep" — narrow enough for a 22-column sidebar
+/// and enough to tell who is worth looking at.
+fn ago(ts_ms: u64) -> String {
+    let then = match chrono::DateTime::from_timestamp_millis(ts_ms as i64) {
+        Some(t) => t.with_timezone(&chrono::Local),
+        None => return String::new(),
+    };
+    let secs = (chrono::Local::now() - then).num_seconds().max(0);
+    match secs {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        86_400..=604_799 => then.format("%a").to_string(),
+        _ => then.format("%-d %b").to_string(),
+    }
 }
 
 fn day_label(date: chrono::NaiveDate) -> String {
@@ -1596,7 +1761,7 @@ mod tests {
 
     fn ui() -> (Ui, mpsc::UnboundedReceiver<UiCommand>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Ui::new("mykey".into(), "me".into(), tx), rx)
+        (Ui::new("mykey".into(), [0u8; 32], "me".into(), tx), rx)
     }
 
     fn press(ui: &mut Ui, c: char) -> bool {
@@ -2010,6 +2175,8 @@ mod tests {
             id: room,
             view: RoomView {
                 name: "kitchen".into(),
+                member_keys: vec![[1u8; 32]],
+                founder: [1u8; 32],
                 members: 1,
                 joined: true,
             },

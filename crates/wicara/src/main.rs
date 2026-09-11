@@ -111,7 +111,28 @@ impl App {
     }
 
     fn status(&self, msg: impl Into<String>) {
-        let _ = self.events.send(UiEvent::Status(msg.into()));
+        let _ = self.events.send(UiEvent::Status {
+            text: msg.into(),
+            bad: false,
+        });
+    }
+
+    /// A note kept beside the conversation it is about, rather than flashing
+    /// past in the status bar and being gone.
+    fn note(&self, peer: [u8; 32], msg: impl Into<String>) {
+        let _ = self.events.send(UiEvent::Note {
+            peer,
+            text: msg.into(),
+        });
+    }
+
+    /// For the ones that mean something went wrong, so they do not read like
+    /// "listening".
+    fn warn(&self, msg: impl Into<String>) {
+        let _ = self.events.send(UiEvent::Status {
+            text: msg.into(),
+            bad: true,
+        });
     }
 
     /// Files an incoming op under the right conversation, after checking the
@@ -192,13 +213,15 @@ impl App {
 
         self.store.lock().unwrap().save_room(&id, &log)?;
         let joined = room.members.contains(&self.me);
-        let name = room.name.clone();
         show_room(self, room)?;
-        self.status(if joined {
-            format!("#{name} membership updated")
-        } else {
-            format!("#{name}: you are no longer a member")
-        });
+        self.note(
+            id,
+            if joined {
+                "membership changed".to_string()
+            } else {
+                "you are no longer a member of this room".to_string()
+            },
+        );
         Ok(())
     }
 
@@ -367,7 +390,7 @@ async fn run(
 
     tokio::spawn(dispatch(app.clone(), command_rx));
 
-    let ui = Ui::new(ep.id().to_string(), app.nickname(), commands);
+    let ui = Ui::new(ep.id().to_string(), app.me, app.nickname(), commands);
     let result = ui::run(ui, event_rx).await;
     ep.close().await;
     result
@@ -421,7 +444,7 @@ fn dial_peer(app: &App, peer: [u8; 32], announce: bool) {
             // Silent when automatic: an offline contact would otherwise repaint
             // the status bar every 20 seconds forever.
             Err(err) if announce => {
-                app.status(format!("could not reach {}: {err}", ui::short(&peer)))
+                app.warn(format!("could not reach {}: {err}", ui::short(&peer)))
             }
             Err(err) => tracing::debug!(%err, peer = %ui::short(&peer), "redial failed"),
         }
@@ -457,8 +480,7 @@ async fn forget(app: &App, peer: [u8; 32]) -> Result<()> {
     let removed = unlink_all(&files).await;
     let _ = app.events.send(UiEvent::Forgotten { peer });
     app.status(format!(
-        "forgotten — {} attachment(s) deleted from this machine",
-        removed
+        "forgotten — {removed} attachment(s) deleted from this machine"
     ));
     Ok(())
 }
@@ -538,7 +560,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                             if let Err(err) =
                                 files::send(app.clone(), conn, peer, PathBuf::from(path)).await
                             {
-                                app.status(format!("could not send that file: {err:#}"));
+                                app.warn(format!("could not send that file: {err:#}"));
                             }
                         });
                     }
@@ -559,14 +581,14 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                 };
                 match saved {
                     Ok(()) => announce_peer(&app, peer),
-                    Err(err) => app.status(format!("could not save that name: {err}")),
+                    Err(err) => app.warn(format!("could not save that name: {err}")),
                 }
                 continue;
             }
             UiCommand::Forget { peer, confirm } => {
                 if confirm {
                     if let Err(err) = forget(&app, peer).await {
-                        app.status(format!("could not forget that: {err:#}"));
+                        app.warn(format!("could not forget that: {err:#}"));
                     }
                 } else {
                     match app.store.lock().unwrap().forget_preview(&peer) {
@@ -574,7 +596,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                             "/forget yes  deletes {msgs} message(s) and {files} file(s) from \
                              this machine — no undo. Their copy is untouched."
                         )),
-                        Err(err) => app.status(format!("could not read that conversation: {err}")),
+                        Err(err) => app.warn(format!("could not read that conversation: {err}")),
                     }
                 }
                 continue;
@@ -590,7 +612,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                             let _ = app.send_log(peer);
                             app.status(format!("conversation emptied — {n} file(s) deleted"));
                         }
-                        Err(err) => app.status(format!("could not clear that: {err}")),
+                        Err(err) => app.warn(format!("could not clear that: {err}")),
                     }
                 } else {
                     match app.store.lock().unwrap().forget_preview(&peer) {
@@ -598,7 +620,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                             "/clear yes  deletes {msgs} message(s) and {files} file(s) but keeps \
                              the contact — no undo. Their copy is untouched."
                         )),
-                        Err(err) => app.status(format!("could not read that conversation: {err}")),
+                        Err(err) => app.warn(format!("could not read that conversation: {err}")),
                     }
                 }
                 continue;
@@ -620,7 +642,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                                 "everything deleted — {n} file(s) gone. Your identity is untouched."
                             ));
                         }
-                        Err(err) => app.status(format!("could not wipe: {err}")),
+                        Err(err) => app.warn(format!("could not wipe: {err}")),
                     }
                 } else {
                     match app.store.lock().unwrap().wipe_preview() {
@@ -629,7 +651,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
                              and {files} file(s) from this machine. Your identity survives; \
                              nothing else does."
                         )),
-                        Err(err) => app.status(format!("could not read the store: {err}")),
+                        Err(err) => app.warn(format!("could not read the store: {err}")),
                     }
                 }
                 continue;
@@ -645,7 +667,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
             UiCommand::Nick(nick) => {
                 *app.nickname.lock().unwrap() = nick.clone();
                 if let Err(err) = app.store.lock().unwrap().set_setting("nickname", &nick) {
-                    let _ = app.events.send(UiEvent::Status(format!("could not save nick: {err}")));
+                    let _ = app.events.send(UiEvent::Status { text: format!("could not save nick: {err}"), bad: true });
                 }
                 let _ = app
                     .outbound
@@ -689,7 +711,7 @@ async fn dispatch(app: App, mut commands: mpsc::UnboundedReceiver<UiCommand>) {
 
         let recorded = app.store.lock().unwrap().record(&peer, &frame);
         if let Err(err) = recorded.and_then(|_| app.send_log(peer)) {
-            app.status(format!("could not save: {err}"));
+            app.warn(format!("could not save: {err}"));
             continue;
         }
 
@@ -704,7 +726,7 @@ async fn accept_loop(ep: Endpoint, app: App) {
             match incoming.await {
                 Ok(conn) => {
                     if let Err(err) = session(conn, app.clone(), false).await {
-                        let _ = app.events.send(UiEvent::Status(format!("session ended: {err}")));
+                        let _ = app.events.send(UiEvent::Status { text: format!("session ended: {err}"), bad: true });
                     }
                 }
                 Err(err) => tracing::warn!(%err, "incoming connection failed"),
@@ -911,6 +933,8 @@ fn show_room(app: &App, room: Room) -> Result<()> {
     let id = room.id;
     let view = ui::RoomView {
         name: room.name.clone(),
+        member_keys: room.members.iter().copied().collect(),
+        founder: room.founder,
         members: room.members.len(),
         joined: room.members.contains(&app.me),
     };
@@ -1011,7 +1035,7 @@ async fn mail_to(app: App, peer: [u8; 32], frame: Frame) {
     .await;
 
     match sent {
-        Ok(()) => app.status(format!("{} is offline — left it on the hub", ui::short(&peer))),
+        Ok(()) => app.note(peer, "they were offline — left on the hub"),
         Err(err) => {
             if let Some(id) = frame.id() {
                 let _ = app.events.send(UiEvent::Delivery {
@@ -1019,7 +1043,8 @@ async fn mail_to(app: App, peer: [u8; 32], frame: Frame) {
                     state: ui::Delivery::Failed,
                 });
             }
-            app.status(format!("could not mail to {}: {err}", ui::short(&peer)))
+            app.note(peer, format!("could not leave it on the hub: {err}"));
+            app.warn(format!("could not mail to {}: {err}", ui::short(&peer)))
         }
     }
 }
@@ -1028,7 +1053,7 @@ async fn mail_to(app: App, peer: [u8; 32], frame: Frame) {
 async fn mailbox_loop(app: App) {
     let Some(hub) = app.hub.clone() else { return };
     if let Err(err) = hub.publish_prekey(&app.prekey).await {
-        app.status(format!("could not publish prekey: {err}"));
+        app.warn(format!("could not publish prekey: {err}"));
     }
     loop {
         match hub.fetch_mail().await {
@@ -1058,7 +1083,7 @@ async fn mailbox_loop(app: App) {
                 // Only after everything is in the local store: until then the
                 // hub holds the only copy.
                 if let Err(err) = hub.delete_mail(&collected).await {
-                    app.status(format!("could not clear the mailbox: {err}"));
+                    app.warn(format!("could not clear the mailbox: {err}"));
                 }
                 if arrived > 0 {
                     app.status(format!("{arrived} message(s) delivered from the hub"));
