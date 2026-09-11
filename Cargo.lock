@@ -4927,9 +4927,10 @@ dependencies = [
 
 [[package]]
 name = "wicara"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "clap",
@@ -4952,7 +4953,7 @@ dependencies = [
 
 [[package]]
 name = "wicara-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4969,7 +4970,7 @@ dependencies = [
 
 [[package]]
 name = "wicara-hub"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",

@@ -3,7 +3,7 @@ members = ["crates/wicara-core", "crates/wicara", "crates/wicara-hub"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/satyaadhiyaksaardy/wicara"
@@ -12,6 +12,7 @@ repository = "https://github.com/satyaadhiyaksaardy/wicara"
 anyhow = "1.0.104"
 axum = "0.8.9"
 argon2 = "0.6.0"
+base64 = "0.22"
 blake3 = "1.8.7"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 chacha20poly1305 = "0.11.0"
