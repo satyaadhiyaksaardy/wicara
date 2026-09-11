@@ -647,7 +647,10 @@ impl Ui {
                 let _ = self.commands.send(UiCommand::Quit);
                 return false;
             }
-            "whoami" => self.status = format!("{} — {}", self.nickname, self.me),
+            "whoami" => {
+                copy_to_clipboard(&self.me);
+                self.status = format!("{} — {} (copied)", self.nickname, self.me);
+            }
             "peers" => {
                 self.status = if self.peers.is_empty() {
                     "no peers yet".into()
@@ -766,6 +769,7 @@ impl Ui {
             return;
         };
         let hex: String = peer.key.iter().map(|b| format!("{b:02x}")).collect();
+        copy_to_clipboard(&hex);
         self.status = match (&peer.room, &peer.alias, &peer.nick) {
             (Some(room), _, _) => format!("#{} · {} members · {hex}", room.name, room.members),
             (None, Some(alias), Some(nick)) => {
@@ -903,7 +907,12 @@ impl Ui {
         }
         let Some(peer) = self.peers.get(self.sel) else {
             frame.render_widget(
-                Paragraph::new("Paste a peer's EndpointId into `wicara run --connect` to begin.")
+                Paragraph::new(
+                    "No conversations yet.\n\n\
+                     /whoami  copies your EndpointId — send it to someone.\n\
+                     /connect <their-id>  starts talking to them.\n\
+                     /help  for everything else.",
+                )
                     .block(self.block("chat", Focus::Chat)),
                 area,
             );
@@ -911,6 +920,8 @@ impl Ui {
         };
 
         let width = (area.width.saturating_sub(2) as usize).max(8);
+        // A bubble needs room; four tmux panes on one screen do not have it.
+        let bubbles = width >= BUBBLE_MIN_PANE;
         let mut lines: Vec<Line> = Vec::new();
         // Which message each rendered row came from, so a click can land on it.
         let mut owners: Vec<usize> = Vec::new();
@@ -944,23 +955,9 @@ impl Ui {
                 // Dimmed, because this is what they call themselves.
                 (peer.label(), Color::DarkGray)
             };
-
-            if let Some(target) = entry.reply_to {
-                let quoted = match peer.log.iter().find(|e| e.id == target) {
-                    Some(e) if e.deleted => "(deleted)",
-                    Some(e) => e.body.as_str(),
-                    None => "(message not here)",
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("  ┆ {}", first_line(quoted, width.saturating_sub(4))),
-                    Style::new().fg(Color::DarkGray),
-                )));
-            }
-
             let stamp = clock(entry.id.ts_ms);
-            let prefix = format!("{stamp} {who}: ");
             // Consecutive messages from one person within a few minutes read as
-            // one run, so only the first carries the name and the clock.
+            // one run, so only the first carries the name.
             let grouped = i > 0 && {
                 let prev = &peer.log[i - 1];
                 prev.id.sender == entry.id.sender
@@ -968,85 +965,107 @@ impl Ui {
                     && peer.unread_from != Some(i)
                     && day(prev.id.ts_ms) == day(entry.id.ts_ms)
             };
-            // The clock stays out of the way; the name carries the colour.
-            let head = || {
-                if grouped {
-                    vec![Span::raw(format!("{:w$}", "", w = prefix.width()))]
-                } else {
-                    vec![
-                        Span::styled(format!("{stamp} "), Style::new().fg(Color::DarkGray)),
-                        Span::styled(format!("{who}: "), Style::new().fg(colour)),
-                    ]
-                }
-            };
-            let body_width = width.saturating_sub(prefix.width()).max(8);
-            if let Some(file) = &entry.attachment {
+            let quoted = entry.reply_to.map(|target| {
+                let text = match peer.log.iter().find(|e| e.id == target) {
+                    Some(e) if e.deleted => "(deleted)",
+                    Some(e) => e.body.as_str(),
+                    None => "(message not here)",
+                };
+                format!("┆ {}", first_line(text, width / 2))
+            });
+            let marker = entry
+                .outbound
+                .then(|| self.delivery.get(&entry.id).map(|d| d.glyph()))
+                .flatten();
+
+            // What goes inside, whichever layout draws it.
+            let (body, style) = if let Some(file) = &entry.attachment {
                 let state = match (self.transfers.get(&entry.id), &file.path) {
                     (Some((done, total)), _) => progress_bar(*done, *total),
                     (None, Some(path)) => format!("saved to {path}"),
                     (None, None) => "waiting for the bytes".into(),
                 };
-                let mut spans = head();
-                spans.push(
-                    Span::styled(
+                (
+                    vec![
                         format!(
                             "📎 {} · {} · blake3 {}",
                             file.name,
                             human(file.size),
-                            file.hash[..4]
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect::<String>()
+                            file.hash[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()
                         ),
-                        Style::new().add_modifier(Modifier::BOLD),
-                    ),
-                );
-                lines.push(Line::from(spans));
-                lines.push(Line::from(Span::styled(
-                    format!("{:w$}{state}", "", w = prefix.width()),
-                    Style::new().fg(Color::DarkGray),
-                )));
+                        state,
+                    ],
+                    Style::new().add_modifier(Modifier::BOLD),
+                )
             } else if entry.deleted {
-                let mut spans = head();
-                spans.push(Span::styled("(deleted)", Style::new().fg(Color::DarkGray)));
-                lines.push(Line::from(spans));
+                (
+                    vec!["(deleted)".to_string()],
+                    Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                )
             } else {
-                let wrapped = wrap(&entry.body, body_width);
-                let last = wrapped.len().saturating_sub(1);
-                for (n, chunk) in wrapped.into_iter().enumerate() {
-                    let mut spans = if n == 0 {
-                        head()
+                let room = if bubbles {
+                    width.min(BUBBLE_MAX).saturating_sub(6).max(8)
+                } else {
+                    width.saturating_sub(stamp.width() + who.width() + 2).max(8)
+                };
+                (wrap(&entry.body, room), Style::new())
+            };
+
+            if bubbles {
+                Bubble {
+                    body,
+                    quoted,
+                    name: (!grouped && !entry.outbound).then(|| who.clone()),
+                    meta: stamp.clone(),
+                    colour,
+                    mine: entry.outbound,
+                    pane: width,
+                    style,
+                    marker,
+                }
+                .render(&mut lines);
+            } else {
+                let prefix = format!("{stamp} {who}: ");
+                if let Some(quote) = quoted {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {quote}"),
+                        Style::new().fg(Color::DarkGray),
+                    )));
+                }
+                for (n, chunk) in body.into_iter().enumerate() {
+                    let mut spans = if n == 0 && !grouped {
+                        vec![
+                            Span::styled(format!("{stamp} "), Style::new().fg(Color::DarkGray)),
+                            Span::styled(format!("{who}: "), Style::new().fg(colour)),
+                        ]
                     } else {
                         vec![Span::raw(format!("{:w$}", "", w = prefix.width()))]
                     };
                     spans.extend(mention_spans(&chunk, &self.nickname));
-                    if n == last && entry.outbound
-                        && let Some(state) = self.delivery.get(&entry.id)
-                    {
-                        let (glyph, colour) = state.glyph();
-                        spans.push(Span::styled(format!(" {glyph}"), Style::new().fg(colour)));
-                    }
                     lines.push(Line::from(spans));
+                }
+                if let Some((glyph, colour)) = marker {
+                    let last = lines.len() - 1;
+                    lines[last]
+                        .spans
+                        .push(Span::styled(format!(" {glyph}"), Style::new().fg(colour)));
                 }
             }
 
             if !entry.reactions.is_empty() {
+                let chips = entry
+                    .reactions
+                    .iter()
+                    .map(|(e, n, mine)| if *mine { format!("[{e} {n}]") } else { format!("{e} {n}") })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let indent = if bubbles && entry.outbound {
+                    width.saturating_sub(chips.width() + 3)
+                } else {
+                    2
+                };
                 lines.push(Line::from(Span::styled(
-                    format!(
-                        "{:w$}{}",
-                        "",
-                        entry
-                            .reactions
-                            .iter()
-                            .map(|(e, n, mine)| if *mine {
-                                format!("[{e} {n}]")
-                            } else {
-                                format!("{e} {n}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                        w = prefix.width()
-                    ),
+                    format!("{:indent$}{chips}", ""),
                     Style::new().fg(Color::Yellow),
                 )));
             }
@@ -1122,7 +1141,7 @@ impl Ui {
             ("/nick <name>", "change what you call yourself"),
             ("/send <path>", "send a file — needs a live connection"),
             ("/room create <name>", "start a room; then /room invite and /room kick"),
-            ("/peers  /whoami", "who is around · your own key"),
+            ("/peers  /whoami", "who is around · your own key, copied to the clipboard"),
             ("/mouse", "hand the mouse back so you can select and copy text"),
             ("/leave", "sign yourself out of the selected room"),
             ("/clear", "empty this conversation but keep the contact"),
@@ -1337,6 +1356,116 @@ fn mention_spans(text: &str, me: &str) -> Vec<Span<'static>> {
         spans.push(Span::raw(rest.to_string()));
     }
     spans
+}
+
+/// Puts text on the system clipboard with OSC 52, which the terminal forwards
+/// even over ssh — the reason `/whoami` can hand you a 64-character key without
+/// you dragging across a pane to select it.
+///
+// ponytail: no check that the terminal honours it. The status line says what
+// was copied, so a terminal that ignores OSC 52 still shows you the value.
+fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    // Written straight to the tty: ratatui's buffer would treat it as content.
+    let _ = std::io::Write::write_all(
+        &mut std::io::stdout(),
+        format!("\x1b]52;c;{encoded}\x07").as_bytes(),
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+/// Below this a bubble has no room to breathe, so the pane falls back to the
+/// compact layout. Four tmux panes on one screen land right around here.
+const BUBBLE_MIN_PANE: usize = 50;
+/// Long lines are hard to read however much room there is.
+const BUBBLE_MAX: usize = 60;
+
+/// One message drawn as a bubble, returning the lines it occupies.
+///
+/// `mine` puts it against the right edge with no name on it — yours is obvious
+/// — and `theirs` against the left under a name. The meta line underneath
+/// carries the clock and, for your own, the delivery mark, which is where a
+/// phone would put its ticks.
+struct Bubble<'a> {
+    body: Vec<String>,
+    quoted: Option<String>,
+    name: Option<String>,
+    meta: String,
+    colour: Color,
+    mine: bool,
+    pane: usize,
+    style: Style,
+    marker: Option<(&'a str, Color)>,
+}
+
+impl Bubble<'_> {
+    fn render(self, out: &mut Vec<Line<'static>>) {
+        let inner = self
+            .body
+            .iter()
+            .chain(self.quoted.iter())
+            .map(|l| l.width())
+            .max()
+            .unwrap_or(0)
+            .max(self.meta.width())
+            .min(self.pane.saturating_sub(5));
+        let box_w = inner + 4;
+        // One column of air on the right, so a bubble never fuses with the
+        // pane border.
+        let pad = if self.mine {
+            self.pane.saturating_sub(box_w + 1)
+        } else {
+            0
+        };
+        let gap = " ".repeat(pad);
+        let bar = "─".repeat(box_w.saturating_sub(2));
+        let edge = Style::new().fg(self.colour);
+
+        if let Some(name) = self.name {
+            out.push(Line::from(Span::styled(format!("{gap}{name}"), edge)));
+        }
+        out.push(Line::from(Span::styled(format!("{gap}╭{bar}╮"), edge)));
+        if let Some(quote) = self.quoted {
+            out.push(Line::from(vec![
+                Span::styled(format!("{gap}│ "), edge),
+                Span::styled(
+                    format!("{quote:<inner$}"),
+                    Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ),
+                Span::styled(" │", edge),
+            ]));
+        }
+        for line in self.body {
+            let pad_to = inner.saturating_sub(line.width());
+            out.push(Line::from(vec![
+                Span::styled(format!("{gap}│ "), edge),
+                Span::styled(line, self.style),
+                Span::styled(format!("{:pad_to$} │", ""), edge),
+            ]));
+        }
+        out.push(Line::from(Span::styled(format!("{gap}╰{bar}╯"), edge)));
+
+        // The clock sits under the bubble on the side the bubble is on. The
+        // delivery mark is counted in the alignment, or it lands past the edge.
+        let mark_w = self.marker.map_or(0, |(g, _)| g.width() + 1);
+        let mut meta = vec![Span::styled(
+            if self.mine {
+                format!(
+                    "{:>w$}",
+                    self.meta,
+                    w = (pad + box_w).saturating_sub(1 + mark_w)
+                )
+            } else {
+                format!("{gap} {}", self.meta)
+            },
+            Style::new().fg(Color::DarkGray),
+        )];
+        if let Some((glyph, colour)) = self.marker {
+            meta.push(Span::styled(format!(" {glyph}"), Style::new().fg(colour)));
+        }
+        out.push(Line::from(meta));
+    }
 }
 
 /// Word wrap on display width, hard-splitting any word wider than the column.
